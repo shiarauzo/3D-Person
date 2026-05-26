@@ -68,6 +68,16 @@ const fragmentShader = /* glsl */ `
   uniform int   uPaletteSize;           // always 9 for now
   uniform float uPaletteMix;            // 0.0 = iter-8 output (default); 1.0 = quantized (iter 10)
 
+  // Iter 11 — Lime bias.
+  // uLimeBias (0.0–1.0) makes mid-luma cells prefer the two green swatches:
+  //   Index 1 = Acid Lime  (#c8f000)
+  //   Index 2 = Toxic Green (#39ff5a)
+  // The bias is applied only in the mid-luma band (tent peak ~0.40) so that
+  // near-void darks and near-white brights still land on their true nearest
+  // palette entry. Default 0.5 gives prominent green body without eliminating
+  // accent variety.
+  uniform float uLimeBias;
+
   varying vec2 vUv;
 
   // Iter 10 helper: find the nearest palette entry using luma-weighted squared
@@ -76,10 +86,28 @@ const fragmentShader = /* glsl */ `
   // space so that skin/body tones map to the closest-feeling neon rather than
   // collapsing arbitrarily. The loop bound is the compile-time constant
   // PALETTE_SIZE — GLSL ES requires a constant upper bound.
-  vec3 nearestPaletteColor(vec3 color) {
+  //
+  // Iter 11 — Green bias: for mid-luma cells the effective distance to palette
+  // indices 1 (Acid Lime) and 2 (Toxic Green) is reduced by a factor of
+  // (1.0 - uLimeBias * midWeight), where midWeight is a tent function peaking
+  // at luma ≈ 0.40. Multiplying the squared distance by a value < 1.0 makes
+  // the greens appear "closer" than they really are, biasing the winner toward
+  // lime for body-tone luma values while leaving dark and bright extremes free
+  // to pick their true nearest swatch (accents survive because their hue
+  // distance to a non-green swatch is still smaller even after the reduction).
+  vec3 nearestPaletteColor(vec3 color, float luma) {
     // Luma weights (Rec.601) — same as the void-floor luma calculation.
     vec3 lumaW = vec3(0.299, 0.587, 0.114);
     vec3 wColor = color * lumaW;
+
+    // Iter 11: tent function centered at luma 0.40, half-width 0.35.
+    // Returns 0.0 outside [0.05, 0.75] and 1.0 at luma 0.40.
+    // Clamp keeps it non-negative on both wings.
+    float midWeight = clamp(1.0 - abs(luma - 0.40) / 0.35, 0.0, 1.0);
+    // Bias multiplier applied to squared distance for the two green swatches.
+    // (1.0 - bias*weight) ∈ [0.5, 1.0] when bias=0.5, so it halves the
+    // effective squared distance at peak mid-luma without zeroing it out.
+    float greenBias = 1.0 - uLimeBias * midWeight;
 
     vec3 best = uPalette[0];
     vec3 wEntry = uPalette[0] * lumaW;
@@ -90,6 +118,12 @@ const fragmentShader = /* glsl */ `
       vec3 wE = uPalette[i] * lumaW;
       vec3 wd = wColor - wE;
       float d = dot(wd, wd);
+      // Iter 11: apply lime bias multiplier to green swatches (indices 1 and 2).
+      // Hardcoded indices match lib/palette.ts order:
+      //   1 = Acid Lime #c8f000, 2 = Toxic Green #39ff5a.
+      if (i == 1 || i == 2) {
+        d *= greenBias;
+      }
       if (d < bestDist) {
         bestDist = d;
         best = uPalette[i];
@@ -124,7 +158,8 @@ const fragmentShader = /* glsl */ `
 
     // Quantize to the nearest neon swatch (luma-weighted perceptual distance).
     // uPaletteMix = 1.0 → full quantization; = 0.0 → pass-through (iter 8 mode).
-    vec3 quantized = nearestPaletteColor(preQuantize);
+    // Iter 11: pass luma so nearestPaletteColor can apply mid-band lime bias.
+    vec3 quantized = nearestPaletteColor(preQuantize, luma);
     vec3 finalRgb = mix(preQuantize, quantized, uPaletteMix);
 
     gl_FragColor = vec4(finalRgb, 1.0);
@@ -287,6 +322,12 @@ export default function Mosaic() {
       // Iter 10 — uPaletteMix = 1.0 activates full palette quantization.
       // Every non-void cell is snapped to its nearest neon swatch; no mid-tones.
       uPaletteMix:    { value: 1.0 },
+      // Iter 11 — Lime bias: 0.0 = no bias (pure nearest-color); 1.0 = maximum
+      // pull toward green swatches for mid-luma cells (may over-green everything).
+      // 0.5 is the tuned default: body mass reads lime while accents survive.
+      // Green swatch indices: 1 = Acid Lime (#c8f000), 2 = Toxic Green (#39ff5a)
+      // — matches lib/palette.ts PALETTE_HEXES ordering.
+      uLimeBias:      { value: 0.5 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
