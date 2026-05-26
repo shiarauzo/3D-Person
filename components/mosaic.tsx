@@ -369,6 +369,31 @@ const fragmentShader = /* glsl */ `
   uniform float uSortRun;
   uniform float uSortAmount;
 
+  // Iter 23 — Face-density region.
+  //
+  // uFaceCenter: face center in vUv space [0,1] (same coordinates the fragment
+  //   shader uses for cell distance comparisons — no extra transform needed here).
+  //   Computed in useFrame by applying the mirror + crop mapping to faceBboxRef.centerX/Y.
+  // uFaceRadius: face bounding-circle radius in vUv units.
+  //   Derived from faceBboxRef.radius (fraction of video height) divided by vSliceZ.
+  // uFaceActive: 0.0 = no face detected (eased out), 1.0 = face fully tracked.
+  // uFaceAccentBoost: extra accent probability multiplier inside the face core.
+  //   effAccent_face = effAccent_body * (1 + faceFactor * uFaceAccentBoost).
+  //   Default 3.0 → up to 4× body accent rate at the face center.
+  // uFaceChaosBias: additional per-cell probability of a random-palette color jump
+  //   inside the face region, independent of the accent path.
+  //   0.0 = no chaos jump; 0.45 = ~45% of face-core cells get a rogue hue.
+  //
+  // faceFactor = uFaceActive * smoothstep(uFaceRadius, uFaceRadius * 0.4, dist)
+  //   where dist = length(vUv - uFaceCenter).
+  //   → 1.0 at the face center, falls to 0 at uFaceRadius, zero outside.
+  //   The inner half (0.4× radius) is the "storm core"; the outer fringe ramps down.
+  uniform vec2  uFaceCenter;
+  uniform float uFaceRadius;
+  uniform float uFaceActive;
+  uniform float uFaceAccentBoost;
+  uniform float uFaceChaosBias;
+
   void main() {
     // =========================================================================
     // FRAGMENT PIPELINE ORDER (iter 19):
@@ -605,7 +630,7 @@ const fragmentShader = /* glsl */ `
     vec3 quantized = nearestPaletteColor(preQuantize, luma);
     vec3 finalRgb = mix(preQuantize, quantized, uPaletteMix);
 
-    // ── Step 4: ACCENT SCATTER ───────────────────────────────────────────────
+    // ── Step 4: ACCENT SCATTER + FACE-DENSITY STORM (iter 23) ────────────────
     // Iter 13 — Accent scatter: sprinkle random accent pops over non-void cells.
     // Strategy: derive a stable per-cell coordinate from vUv, then draw two hashes
     // — one to decide IF this cell gets an accent, one to pick WHICH accent color.
@@ -614,33 +639,77 @@ const fragmentShader = /* glsl */ `
     // Iter 20 — Motion boost: effective accent probability is amplified by the
     // motion signal. effAccentAmount = uAccentAmount * (1 + uMotion * boost).
     // Clamped to 0.95 so the figure can never become a solid blob of accents.
+    //
+    // Iter 23 — Face-density region:
+    //   faceFactor ∈ [0,1] — 1 at the face center, 0 outside uFaceRadius.
+    //   Uses uFaceActive so it gracefully eases to 0 when no face is detected.
+    //   Two effects inside the face:
+    //     a) Accent boost: effAccent * (1 + faceFactor * uFaceAccentBoost).
+    //        More accent color pops inside the face — the "focal storm".
+    //     b) Chaos jump: a hash-gated probability (faceFactor * uFaceChaosBias)
+    //        picks a fully random palette entry, breaking the lime body bias and
+    //        adding intense hue chaos. Applied before the accent gate so it only
+    //        fires when accent does NOT fire (two independent effects, no double-
+    //        override).
+    //   Body cells (faceFactor ≈ 0) are unchanged — calmer lime remains.
     if (luma >= effectiveThreshold) {
       // Cell grid coordinate — integer pair, one per mosaic square.
       // float(GRID_W/GRID_H) must be a literal constant for GLSL ES.
       vec2 cell = floor(vUv * 64.0);
 
-      // Iter 20: motion-boosted accent probability. Clamp hard at 0.95.
-      float effAccentAmount = min(uAccentAmount * (1.0 + uMotion * uMotionAccentBoost), 0.95);
+      // Iter 23: compute face-region factor for this cell.
+      // dist: euclidean distance in vUv space from this cell's UV to face center.
+      // smoothstep inner edge = uFaceRadius * 0.4 (storm core), outer = uFaceRadius.
+      // faceFactor is 1 at the core, fades smoothly to 0 at the outer radius.
+      float dist = length(vUv - uFaceCenter);
+      float faceFactor = uFaceActive * smoothstep(uFaceRadius, uFaceRadius * 0.4, dist);
 
-      // First hash: scatter probability gate.
-      float h1 = cellHash(cell);
-      if (h1 < effAccentAmount) {
-        // Second hash (offset seed so it's independent of h1): pick accent index.
-        float h2 = cellHash(cell + vec2(57.0, 31.0));
-        // Map h2 uniformly onto [0, ACCENT_COUNT-1].
-        int accentIdx = int(h2 * float(ACCENT_COUNT));
-        // Clamp in case h2 == 1.0 exactly.
-        accentIdx = accentIdx < ACCENT_COUNT ? accentIdx : ACCENT_COUNT - 1;
+      // Iter 20: motion-boosted accent probability (body baseline).
+      float effAccentAmount = uAccentAmount * (1.0 + uMotion * uMotionAccentBoost);
+      // Iter 23: additional face boost — only inside the face region.
+      // Body accent rate is NOT raised here (faceFactor ≈ 0 outside face).
+      effAccentAmount = effAccentAmount * (1.0 + faceFactor * uFaceAccentBoost);
+      // Cap: never fully saturate — preserve some lime body cells even at the face.
+      effAccentAmount = min(effAccentAmount, 0.95);
 
-        // Select accent color.  GLSL ES 1.0 requires constant loop / array index;
-        // use an if-chain (5 branches, trivially unrolled by the driver).
-        vec3 accentColor = uAccents[0];
-        if (accentIdx == 1) accentColor = uAccents[1];
-        if (accentIdx == 2) accentColor = uAccents[2];
-        if (accentIdx == 3) accentColor = uAccents[3];
-        if (accentIdx == 4) accentColor = uAccents[4];
+      // Iter 23: chaos jump — random palette entry inside the face.
+      // Fires before the regular accent gate so both effects are independent.
+      // Uses a third hash with a different seed to keep it uncorrelated.
+      float hChaos = cellHash(cell + vec2(23.0, 71.0));
+      float chaosProb = faceFactor * uFaceChaosBias;
+      if (hChaos < chaosProb) {
+        // Pick any of the 5 accent colors (same set) as the chaos color.
+        float hChaosIdx = cellHash(cell + vec2(111.0, 43.0));
+        int chaosIdx = int(hChaosIdx * float(ACCENT_COUNT));
+        chaosIdx = chaosIdx < ACCENT_COUNT ? chaosIdx : ACCENT_COUNT - 1;
+        vec3 chaosColor = uAccents[0];
+        if (chaosIdx == 1) chaosColor = uAccents[1];
+        if (chaosIdx == 2) chaosColor = uAccents[2];
+        if (chaosIdx == 3) chaosColor = uAccents[3];
+        if (chaosIdx == 4) chaosColor = uAccents[4];
+        finalRgb = chaosColor;
+      } else {
+        // Regular accent scatter (body + face both, but face has higher effAccentAmount).
+        // First hash: scatter probability gate.
+        float h1 = cellHash(cell);
+        if (h1 < effAccentAmount) {
+          // Second hash (offset seed so it's independent of h1): pick accent index.
+          float h2 = cellHash(cell + vec2(57.0, 31.0));
+          // Map h2 uniformly onto [0, ACCENT_COUNT-1].
+          int accentIdx = int(h2 * float(ACCENT_COUNT));
+          // Clamp in case h2 == 1.0 exactly.
+          accentIdx = accentIdx < ACCENT_COUNT ? accentIdx : ACCENT_COUNT - 1;
 
-        finalRgb = accentColor;
+          // Select accent color.  GLSL ES 1.0 requires constant loop / array index;
+          // use an if-chain (5 branches, trivially unrolled by the driver).
+          vec3 accentColor = uAccents[0];
+          if (accentIdx == 1) accentColor = uAccents[1];
+          if (accentIdx == 2) accentColor = uAccents[2];
+          if (accentIdx == 3) accentColor = uAccents[3];
+          if (accentIdx == 4) accentColor = uAccents[4];
+
+          finalRgb = accentColor;
+        }
       }
     }
 
@@ -741,6 +810,43 @@ const MOTION_ACCENT_BOOST = 1.5;
 const MOTION_DEFORM_BOOST = 0.6;
 
 // ---------------------------------------------------------------------------
+// Iter 23 — Face-density region constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Lerp speed for smoothing the face center position each frame.
+ * Slower than hands (0.12 vs 0.25) because the face moves less and we want
+ * a stable "storm" rather than a jittery one.
+ */
+const FACE_CENTER_LERP = 0.12;
+
+/**
+ * Lerp speed for smoothing the face radius each frame.
+ * Radius changes slowly (head tilt/zoom), so a gentle lerp prevents popping.
+ */
+const FACE_RADIUS_LERP = 0.08;
+
+/**
+ * Lerp speed for easing uFaceActive in/out (0→1 when face appears, 1→0 when lost).
+ */
+const FACE_ACTIVE_LERP = 0.10;
+
+/**
+ * uFaceAccentBoost: how much extra accent probability is added inside the face region.
+ * effAccent inside face = base_effAccent * (1 + faceFactor * uFaceAccentBoost).
+ * Default 3.0 → up to 4× more accents at the face core. Capped in shader at 0.95.
+ */
+const FACE_ACCENT_BOOST = 3.0;
+
+/**
+ * uFaceChaosBias: probability (additional) that a face-region cell picks a
+ * fully random palette color (chaos jump) rather than the lime-biased quantize.
+ * 0.0 = no extra chaos; 1.0 = all face cells get a random palette entry.
+ * Default 0.45 — roughly half of face cells will exhibit color chaos.
+ */
+const FACE_CHAOS_BIAS = 0.45;
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -749,7 +855,8 @@ export default function Mosaic() {
 
   // Iter 16: read the shared landmarks ref (single detect loop, no duplicate).
   // Iter 18: read maskTextureRef for the selfie segmentation mask.
-  const { landmarksRef, maskTextureRef } = useTrackingContext();
+  // Iter 23: read faceBboxRef for face-density region.
+  const { landmarksRef, maskTextureRef, faceBboxRef } = useTrackingContext();
 
   const { size, gl } = useThree();
 
@@ -980,6 +1087,23 @@ export default function Mosaic() {
       uSortThreshold:   { value: 0.55 },
       uSortRun:         { value: 0.08 },
       uSortAmount:      { value: 0.18 },
+      // Iter 23 — Face-density region uniforms.
+      // uFaceCenter: face center in vUv [0,1] space. Initial value centres the
+      //   storm at a typical head position; overwritten each frame from faceBboxRef.
+      // uFaceRadius: radius in vUv units. ~0.25 ≈ 25% of the frame height for a
+      //   typical seated webcam framing.  Overwritten each frame.
+      // uFaceActive: 0.0 until a face is detected; eased 0→1 on detection,
+      //   1→0 when lost. Keeps the effect invisible until tracking confirms a face.
+      // uFaceAccentBoost: accent multiplier headroom for the face core.
+      //   effAccent_face = effAccent_body * (1 + faceFactor * uFaceAccentBoost).
+      //   Default 3.0 → up to 4× body accent rate at the center.
+      // uFaceChaosBias: additional chaos-jump probability inside the face.
+      //   Default 0.45 → ~45% of face-core cells get a random-palette color jump.
+      uFaceCenter:      { value: new THREE.Vector2(0.5, 0.35) },
+      uFaceRadius:      { value: 0.25 },
+      uFaceActive:      { value: 0.0 },
+      uFaceAccentBoost: { value: FACE_ACCENT_BOOST },
+      uFaceChaosBias:   { value: FACE_CHAOS_BIAS },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
@@ -1083,6 +1207,14 @@ export default function Mosaic() {
   const smoothedActive0 = useRef(0);
   const smoothedActive1 = useRef(0);
 
+  // Iter 23 — Smoothed face-region state (mutable refs, no re-render cost).
+  // smoothedFaceCenter: face center in vUv [0,1] space, lerped each frame.
+  // smoothedFaceRadius: face radius in vUv units, lerped each frame.
+  // smoothedFaceActive: eased 0→1 on detection, 1→0 when lost.
+  const smoothedFaceCenter = useRef(new THREE.Vector2(0.5, 0.35));
+  const smoothedFaceRadius = useRef(0.25);
+  const smoothedFaceActive = useRef(0);
+
   // Iter 20 — Motion signal state (mutable refs — no re-render cost).
   // prevSmoothed0/1: previous frame's smoothed hand position, used to compute
   // per-frame displacement (speed). Updated AFTER the lerp each frame.
@@ -1165,6 +1297,83 @@ export default function Mosaic() {
       smoothedActive1.current += (1 - smoothedActive1.current) * ACTIVE_LERP_SPEED;
     } else {
       smoothedActive1.current += (0 - smoothedActive1.current) * ACTIVE_LERP_SPEED;
+    }
+
+    // ── Iter 23: face-density region uniform update ──────────────────────────
+    // Read the face bbox from the tracking context (updated by the rAF detect loop).
+    // Map the RAW MediaPipe face center into vUv space.
+    //
+    // Key insight: vUv (= aUv) IS the raw video texture coordinate, not a
+    // normalised [0,1] crop-space value.  vUv.x ∈ [uMinZ, uMaxZ],
+    // vUv.y ∈ [vMinZ, vMaxZ] — both sub-ranges of [0,1] raw video UV.
+    //
+    // Therefore:
+    //   u_vUv = centerX   (raw video X — the cell sampling centerX has vUv.x=centerX)
+    //   v_vUv = centerY   (raw video Y — the cell sampling centerY has vUv.y=centerY;
+    //                      the geometry's (1-normRow) V-flip keeps the display upright
+    //                      so face-at-top-of-video → face-at-top-of-screen, both at
+    //                      small vUv.y)
+    //   r_vUv = radius    (raw video-space Euclidean distance, same scale as vUv)
+    //
+    // No mirror/crop normalisation is needed — those transforms determine SCREEN
+    // POSITION (which normCol/normRow shows the face) but do not change the value
+    // of vUv at that cell.  The earlier incorrect code normalised both axes to [0,1]
+    // (lmToWorld crop-space), putting uFaceCenter in a different system from the
+    // shader's vUv and causing the storm to drift off the actual face region.
+    {
+      const faceBbox = faceBboxRef.current;
+      const { uMinZ, uSliceZ, vMinZ, vSliceZ } = cropRef.current;
+
+      if (faceBbox && faceBbox.active && vSliceZ > 0) {
+        // Mirror + crop: map RAW landmark space → vUv space.
+        //
+        // vUv (= aUv) is the raw video texture coordinate: vUv.x ∈ [uMinZ, uMaxZ],
+        // vUv.y ∈ [vMinZ, vMaxZ].  It is NOT normalised to [0,1] — it IS the
+        // texture UV the cell samples from.
+        //
+        // U axis: the cell displaying raw video pixel at X = centerX has
+        //   vUv.x = uMaxZ - normCol * uSliceZ = centerX (since that cell is the
+        //   one whose texture UV equals the face's raw video X).  The selfie mirror
+        //   is a screen-position effect only — it doesn't alter vUv.x.
+        //   → u_vUv = centerX  (unmirrored raw video X, already in [uMinZ, uMaxZ])
+        //
+        // V axis: the cell displaying raw video pixel at Y = centerY has
+        //   vUv.y = vMinZ + (1 - normRow) * vSliceZ = centerY.
+        //   The geometry's (1 - normRow) flip makes normRow→1 (top of screen) map
+        //   to vMinZ (top of video), so the display is upright — face at top of
+        //   video → face at top of screen, both at small vUv.y.
+        //   → v_vUv = centerY  (raw video Y, already in [vMinZ, vMaxZ])
+        //
+        // This is correct because vUv IS the raw texture coordinate space.
+        // Earlier code incorrectly normalised both axes to [0,1] (crop-space),
+        // putting uFaceCenter in a different coordinate system from the shader's
+        // vUv, causing the storm to drift off the actual face.
+        //
+        // Radius: faceBbox.radius is Euclidean distance in raw video space
+        //   [0,1]×[0,1] (video normalised).  vUv.y is in the same space
+        //   ([vMinZ, vMaxZ] ⊂ [0,1]).  Use radius directly — no vSliceZ division.
+        //   (The approximation ignores the aspect-ratio difference between U and V
+        //   pixel density, but for a circular influence region one scalar is fine.)
+        const u_vUv = faceBbox.centerX;                    // raw video X = vUv.x
+        const v_vUv = faceBbox.centerY;                    // raw video Y = vUv.y (V inversion baked in)
+        const r_vUv = faceBbox.radius;                     // radius in vUv-space units (same scale)
+
+        // Lerp smoothed face center and radius toward new values.
+        smoothedFaceCenter.current.x += (u_vUv - smoothedFaceCenter.current.x) * FACE_CENTER_LERP;
+        smoothedFaceCenter.current.y += (v_vUv - smoothedFaceCenter.current.y) * FACE_CENTER_LERP;
+        smoothedFaceRadius.current   += (r_vUv - smoothedFaceRadius.current)   * FACE_RADIUS_LERP;
+
+        // Ease active toward 1.
+        smoothedFaceActive.current += (1 - smoothedFaceActive.current) * FACE_ACTIVE_LERP;
+      } else {
+        // No face: ease active toward 0 (center/radius hold at last valid values).
+        smoothedFaceActive.current += (0 - smoothedFaceActive.current) * FACE_ACTIVE_LERP;
+      }
+
+      // Write face uniforms.
+      (uniforms.uFaceCenter.value as THREE.Vector2).copy(smoothedFaceCenter.current);
+      uniforms.uFaceRadius.value = smoothedFaceRadius.current;
+      uniforms.uFaceActive.value = smoothedFaceActive.current;
     }
 
     // ── Iter 20: motion signal update ───────────────────────────────────────
