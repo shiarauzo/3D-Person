@@ -184,7 +184,6 @@ const vertexShader = /* glsl */ `
 `;
 
 const fragmentShader = /* glsl */ `
-  uniform sampler2D uVideo;
   uniform vec3  uVoidColor;       // near-black void (#0a0f0a)  iter 8
   uniform float uVoidThreshold;   // base luma threshold; below this → snap to void  iter 8/12
 
@@ -194,9 +193,9 @@ const fragmentShader = /* glsl */ `
   // uTearProbability: fraction of bands that actually tear (~0.20-0.35).
   // uTearAmount:      maximum horizontal UV shift magnitude (~0.02-0.06).
   //
-  // The tear is purely in the fragment stage: BEFORE any texture sample we
-  // compute a per-band U offset and apply it to a new tearUv.  Both uVideo
-  // and uMask are sampled from tearUv so color + mask travel together.
+  // The tear is purely in the fragment stage: BEFORE any mask sample we
+  // compute a per-band U offset and apply it to a new tearUv.  uMask is
+  // sampled from tearUv so the silhouette gate travels with the shift.
   // The shift is constant across the whole band (no smoothstep) → blocky.
   // Tear amplitude is scaled by uMotion so movement drives more tearing.
   uniform float uTime;
@@ -355,6 +354,56 @@ const fragmentShader = /* glsl */ `
     return fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
   }
 
+  // V2 — Procedural neon field helpers.
+  //
+  // valueNoise: smooth 2D value noise from a lattice hash.
+  // Samples 4 lattice corners, interpolates with smoothstep to avoid
+  // block artifacts. Operates on the cell lattice so it is spatially
+  // coherent at the mosaic cell scale — produces large lime blobs, not
+  // TV static.
+  float valueNoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    // Smoothstep interpolation weights.
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    // Four lattice corners.
+    float a = cellHash(i + vec2(0.0, 0.0));
+    float b = cellHash(i + vec2(1.0, 0.0));
+    float c = cellHash(i + vec2(0.0, 1.0));
+    float d = cellHash(i + vec2(1.0, 1.0));
+    // Bilinear interpolation.
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+  }
+
+  // synthField: combine vertical body gradient + slow value-noise drift +
+  // per-cell accent scatter into a single synthetic luma in [0, 1].
+  //
+  //   vGrad:     vertical body gradient.
+  //              vUv.y is LARGE at the lower chest (~0.90) and SMALL at the
+  //              face (~0.10) (same orientation as the lower-body void bias).
+  //              We want the torso/chest to be calmer mid-value lime and
+  //              the face (small vUv.y) to be hotter/brighter. So we INVERT
+  //              vUv.y: gradient = 1 - vUv.y → face≈0.9, chest≈0.1.
+  //              A smoothstep over [0.05, 0.95] keeps the range clean.
+  //   nz:        low-frequency value noise driven by uTime drift.
+  //              Scale ~4 means noise has correlation length ≈ 16 cells —
+  //              produces coherent lime regions rather than salt-and-pepper.
+  //              Drift speed 0.07 gives gentle motion at a calm idle.
+  //   synthLuma: weighted blend: noise dominant (0.65) for variety, gradient
+  //              secondary (0.35) for body-structure bias toward face hotness.
+  //
+  // Returns synthLuma in [0, 1]. Caller applies mask-edge boost separately.
+  float synthField(vec2 cell) {
+    // Vertical gradient: face region → high (bright/hot), chest → low (calm).
+    float vGrad = smoothstep(0.05, 0.95, 1.0 - vUv.y);
+
+    // Low-frequency value noise: coherent blobs, slow time drift.
+    float nz = valueNoise(cell * 0.065 + uTime * 0.07);
+
+    // Weighted blend.
+    return clamp(nz * 0.65 + vGrad * 0.35, 0.0, 1.0);
+  }
+
   // Iter 22 — Pixel-sort streaks (Kim Asendorf-style horizontal smear).
   //
   // uSortThreshold:  luma value above (or below) which a cell is a "sort trigger".
@@ -420,17 +469,17 @@ const fragmentShader = /* glsl */ `
   //   G samples at sampleUv                         (reference channel)
   //   B samples at sampleUv + vec2(-off, 0.0)
   //
-  // Clamped to [0,1] so R and B never read outside the valid texture area.
-  // Because uVideo uses NearestFilter the offset stays blocky/cell-quantized —
-  // the split nudges which palette swatch a cell picks rather than blending.
+  // The channel-split offset is snapped to whole-cell steps (quantized to the
+  // grid) so the chromatic fringe stays blocky / cell-quantized — the split
+  // nudges which palette swatch a cell picks rather than blending smoothly.
   //
   // Pipeline order:
-  //   channel split → luma (from G) → void gate → palette quantize → accents
-  // The split therefore affects the pre-quantize color, letting it shift which
-  // neon swatch wins and adding hue variety / extra corruption in hot zones.
+  //   channel split (hash domain) → synthLuma → void gate → palette quantize → accents
+  // The split therefore affects the pre-quantize synthetic color, letting it
+  // shift which neon swatch wins and adding hue variety in hot zones.
   //
-  // Mask + void decisions use sampleUv (not the split offsets) so the
-  // silhouette gate stays aligned — only the sampled RGB color is split.
+  // Mask decisions use tearUv (unmodified by sort or channel-split) so the
+  // silhouette gate stays aligned — only the procedural color field is split.
   uniform float uChannelShift;
   uniform float uChannelFaceBias;
   uniform float uChannelTearBias;
@@ -547,9 +596,10 @@ const fragmentShader = /* glsl */ `
       float effSortAmount = min(uSortAmount * (1.0 + uMotion * 1.0), 0.80);
 
       if (hSortCell < effSortAmount) {
-        // Quick luma probe at tearUv (cheap — same texel we'll sample below).
-        vec4 probeTex = texture2D(uVideo, tearUv);
-        float probeLuma = dot(probeTex.rgb, vec3(0.299, 0.587, 0.114));
+        // Luma probe from the procedural field — no video read needed.
+        // Use the cell at tearUv to stay coherent with the tear-shifted grid.
+        vec2 probeCell = floor(tearUv * 64.0);
+        float probeLuma = synthField(probeCell);
 
         // Threshold gate: only bright-enough cells trigger the sort run.
         if (probeLuma >= uSortThreshold) {
@@ -599,84 +649,111 @@ const fragmentShader = /* glsl */ `
                       + tearActive * uChannelTearBias
                       + uMotion    * 0.15;
     csIntensity = clamp(csIntensity, 0.0, 1.0);
-    float off = uChannelShift * csIntensity;
 
-    // Three samples — R and B displaced left/right in U, G is the reference.
-    // Clamp to [0,1] so we never read outside the valid texture area.
-    // NearestFilter ensures the displacement stays blocky / cell-quantized.
-    float r = texture2D(uVideo, vec2(clamp(sampleUv.x + off, 0.0, 1.0), sampleUv.y)).r;
-    float g = texture2D(uVideo, sampleUv).g;
-    float b = texture2D(uVideo, vec2(clamp(sampleUv.x - off, 0.0, 1.0), sampleUv.y)).b;
-    vec4 texColor = vec4(r, g, b, 1.0);
+    // Channel-split offset: snap to whole-cell steps so the fringe stays
+    // blocky (cell-quantized) rather than smooth. One cell width = 1/64.
+    // off is measured in UV units; round to nearest cell boundary.
+    float offRaw = uChannelShift * csIntensity;
+    float cellSize = 1.0 / 64.0;
+    float off = floor(offRaw / cellSize + 0.5) * cellSize;
 
-    // Iter 6: hard square cells. We do NOT test gl_PointCoord distance so the
-    // full point-sprite quad is filled — no circular masking, no discard, no
-    // alpha smoothstep. Every fragment within the point gets the same sampled
-    // color, producing a hard aliased square cell with no soft edges.
+    // V2 — Procedural channel-split: sample the synthetic field at three
+    // slightly shifted cell lattice positions.  This reproduces the RGB-fringe
+    // corruption on the face and tear bands without reading the video texture.
     //
-    // Color path: tex.colorSpace = THREE.NoColorSpace → GPU samples raw bytes
-    // with no Three.js color-space conversion. The video stream is natively
-    // sRGB; we output it directly. The renderer output colorspace is also sRGB,
-    // so there is no double-encode.
-    // Iter 21: sample video from tearUv (shifted) instead of vUv.
-    // Iter 22: sampleUv may further shift the U coordinate for pixel-sort streaks.
-    //          The mask continues to sample from tearUv (unmodified by sort) so
-    //          the silhouette gate stays aligned with the band-shifted geometry,
-    //          not the column-held smear position (mask shouldn't smear).
-    // Iter 24: texColor is now a channel-split composite (R/G/B from different
-    //          U offsets).  All downstream stages (luma, void, quantize, accents)
-    //          consume this split color unchanged — the split is pre-quantize.
+    // Base cell for each channel. We shift sampleUv.x by ±off (quantized),
+    // then derive the cell coordinate for that shifted UV position.
+    vec2 baseCell = floor(sampleUv * 64.0);
+    // Shift in cell units (off is already quantized to cell grid).
+    float cellOff = off * 64.0;
+    vec2 cellR = baseCell + vec2( cellOff, 0.0);
+    vec2 cellG = baseCell;
+    vec2 cellB = baseCell + vec2(-cellOff, 0.0);
+
+    // Per-channel synthetic luma.
+    float lumR = synthField(cellR);
+    float lumG = synthField(cellG);
+    float lumB = synthField(cellB);
+
+    // Build a synthetic base color using the channel-split lumas as R/G/B
+    // modulation on top of a lime-biased base (matching the palette intent).
+    // Acid Lime is (200/255, 240/255, 0/255) ≈ (0.784, 0.941, 0.0).
+    // We use the G-channel luma as the master synthLuma (reference channel),
+    // and modulate R/B channels with their shifted lumas so the channel split
+    // creates visible hue shifts near the face/tears.
+    vec3 limeBase = vec3(0.784, 0.941, 0.0);
+    // Slightly de-saturate toward channel luma so the split is visible.
+    vec3 texColor = vec3(
+      mix(limeBase.r, lumR, 0.55),
+      mix(limeBase.g, lumG, 0.55),
+      mix(limeBase.b, lumB, 0.55)
+    );
+
+    // V2: texColor is the procedural channel-split synthetic color.
+    // All downstream stages (luma, void, quantize, accents) consume it —
+    // the split is pre-quantize. Hard square cells — no circular masking.
 
     // ── Step 1: MASK GATE ─────────────────────────────────────────────────────
-    // Iter 18/19 — Segmentation mask gate (silhouette boundary).
+    // V2 — Segmentation mask gate (silhouette boundary).
     //
-    // Sample the 256×256 person-probability mask at the same UV as the video
-    // texture. vUv encodes the mirrored+cropped+zoomed UV, so it reads the
-    // correct mask texel for this cell (see coordinate alignment note above).
+    // Cold-start guard: when uMaskActive == 0.0 (mask not yet produced by
+    // MediaPipe), output void immediately — NO neon flash before the mask
+    // arrives. The synthetic color field would otherwise fill the full canvas.
     //
-    // When uMaskActive == 0.0 (mask not ready), skip masking entirely so the
-    // mosaic renders as it did before iter 18 — no visual regression on load.
-    //
-    // Iter 19 — HARD ALIASED EDGE:
-    //   The silhouette boundary is determined by a HARD STEP — no smoothstep,
-    //   no mix, no alpha gradient at the boundary. This produces the jagged,
-    //   aliased edge required by docs/visual-reference.md (§4 "Edges are
-    //   jagged/aliased on purpose — no anti-aliasing").
-    //
-    //   Implementation:
-    //     a) Apply uMaskGamma: prob = pow(raw, uMaskGamma)
-    //        (gamma > 1 tightens the silhouette by suppressing low-confidence
-    //         border pixels; = 1.0 is identity; < 1 expands it)
-    //     b) Hard binary decision: step(uMaskThreshold, prob)
-    //        → 0.0 when prob < threshold (off-person → void)
-    //        → 1.0 when prob >= threshold (person → continue)
-    //     No interpolation anywhere in this path.
-    if (uMaskActive > 0.5) {
-      // Iter 21: sample mask from tearUv so mask gate travels with the video shift.
+    // Once the mask is ready (uMaskActive ≥ 1.0):
+    //   Sample the 256×256 person-probability mask at tearUv (tear-shifted).
+    //   Apply uMaskGamma (iter 19): prob = pow(raw, uMaskGamma).
+    //     gamma > 1 → tighter silhouette; gamma < 1 → looser.
+    //   Hard binary step (NO smoothstep — aliased edge as per visual-reference):
+    //     step(uMaskThreshold, prob) → 0.0 = off-person, 1.0 = person.
+    //   Off-person cells output void and return immediately.
+    if (uMaskActive < 0.5) {
+      // Mask not ready yet → void everywhere (no neon flash on cold start).
+      gl_FragColor = vec4(uVoidColor, 1.0);
+      return;
+    }
+
+    // Mask is valid — gate off-person cells to void.
+    {
       float rawProb  = texture2D(uMask, tearUv).r;
-      // Iter 19: gamma on raw probability to tighten/loosen silhouette edge.
-      // pow(x, 1.0) = x (identity); pow(x, 2.0) shrinks borderline edge pixels.
       float maskProb = pow(rawProb, uMaskGamma);
-      // Hard step: 0.0 = off-person, 1.0 = person. NO smoothstep — aliased edge.
       float inPerson = step(uMaskThreshold, maskProb);
       if (inPerson < 0.5) {
-        // Off-person → void immediately; skip all body processing below.
         gl_FragColor = vec4(uVoidColor, 1.0);
         return;
       }
     }
 
     // ── Step 2: LUMA VOID FLOOR (inside-mask only) ───────────────────────────
-    // Iter 8 — Void floor: collapse very dark cells to the exact void color so
-    // background noise merges seamlessly with the scene background (#0a0f0a).
-    // Luma via Rec.601 weights (GLSL r169-valid; no nonexistent functions used).
+    // V2 — Derive synthetic luma from the procedural field + mask-edge boost.
     //
-    // Iter 19 — This step ONLY executes for cells that passed the mask gate
-    // above (i.e. cells inside the person silhouette). Off-person cells already
-    // returned as void — so luma voids punch holes only INSIDE the body, never
-    // in the already-void background. This keeps the silhouette clean and avoids
-    // redundant computation on background cells.
-    float luma = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
+    // Base synthLuma from the procedural field (noise + vertical gradient).
+    // Mask-edge term: sample mask at ±1 cell to estimate a local gradient.
+    //   Cells near the silhouette boundary read as edge (high edgeFactor) →
+    //   boosted synthLuma → hotter/busier color at the rim, matching the
+    //   visual reference's jagged neon edge. Interior body stays calm lime.
+    //
+    // The final synthLuma feeds the void gate and palette quantize in place of
+    // the former video luma — no webcam RGB involved anywhere in this path.
+    float baseSynth = synthField(cellG); // use the G-channel (reference) cell
+
+    // Cheap mask-edge estimate: sample mask 1 cell away in each axis.
+    float cellUVStep = 1.0 / 64.0;
+    float mUp    = texture2D(uMask, tearUv + vec2(0.0,  cellUVStep)).r;
+    float mDown  = texture2D(uMask, tearUv + vec2(0.0, -cellUVStep)).r;
+    float mLeft  = texture2D(uMask, tearUv + vec2(-cellUVStep, 0.0)).r;
+    float mRight = texture2D(uMask, tearUv + vec2( cellUVStep, 0.0)).r;
+    // Gradient magnitude (cheap discrete approximation).
+    float maskGrad = length(vec2(mRight - mLeft, mUp - mDown)) * 2.0;
+    float edgeFactor = clamp(maskGrad, 0.0, 1.0);
+
+    // Face region also reads hotter (faceFactor already computed above).
+    // Boost synthLuma at edges and face; interior body stays mid-range for lime.
+    float synthLuma = clamp(baseSynth + edgeFactor * 0.35 + faceFactor * 0.25, 0.0, 1.0);
+
+    // Keep "luma" as the canonical variable name so all downstream stages
+    // (void threshold, palette quantize, accent gate) are unchanged.
+    float luma = synthLuma;
 
     // Iter 12 — Effective void threshold with lower-body spatial bias.
     // vUv.y is LARGE at the lower chest (~0.90) and SMALL at the face (~0.10)
@@ -696,7 +773,7 @@ const fragmentShader = /* glsl */ `
     // all 9 palette entries (including void black at index 0) are candidates —
     // near-dark-but-above-threshold cells will naturally pick void black anyway.
     // Iter 12: use effectiveThreshold instead of raw uVoidThreshold.
-    vec3 preQuantize = luma < effectiveThreshold ? uVoidColor : texColor.rgb;
+    vec3 preQuantize = luma < effectiveThreshold ? uVoidColor : texColor;
 
     // ── Step 3: PALETTE QUANTIZE + LIME BIAS ─────────────────────────────────
     // Quantize to the nearest neon swatch (luma-weighted perceptual distance).
@@ -961,33 +1038,9 @@ export default function Mosaic() {
   const dpr = gl.getPixelRatio();
   const cellPx = (squarePx / GRID_W) * dpr * 1.02;
 
-  // -------------------------------------------------------------------------
-  // VideoTexture
-  // -------------------------------------------------------------------------
-  const texture = useMemo(() => {
-    const video = videoRef.current;
-    if (!video || status !== "ready") return null;
-
-    const tex = new THREE.VideoTexture(video);
-    // NoColorSpace: Three.js applies no color-space conversion when sampling.
-    // The video bytes are natively sRGB; the fragment shader outputs them
-    // directly. This avoids the non-existent LinearTosRGB and prevents
-    // double-encoding (sRGB→linear→sRGB) that would wash out colors.
-    tex.colorSpace = THREE.NoColorSpace;
-    // NearestFilter keeps the blocky look and avoids blurring across cells.
-    tex.minFilter = THREE.NearestFilter;
-    tex.magFilter = THREE.NearestFilter;
-    tex.generateMipmaps = false;
-    return tex;
-  }, [videoRef, status]);
-
-  // Dispose texture on unmount / when the texture reference changes.
-  // VideoTexture is created imperatively in useMemo so R3F will not auto-dispose it.
-  useEffect(() => {
-    return () => {
-      texture?.dispose();
-    };
-  }, [texture]);
+  // V2: VideoTexture removed — the video element stays mounted for MediaPipe
+  // segmentation/landmark input but is never uploaded to the GPU as a color
+  // source. The shader uses a procedural synthetic field for all colors.
 
   // -------------------------------------------------------------------------
   // BufferGeometry — build once per grid size
@@ -1074,7 +1127,6 @@ export default function Mosaic() {
   // -------------------------------------------------------------------------
   const uniforms = useMemo<Record<string, THREE.IUniform>>(
     () => ({
-      uVideo:         { value: texture },
       uPointSize:     { value: cellPx },
       // Iter 8 — void floor uniforms.
       // uVoidColor carries the RAW sRGB bytes of #0a0f0a (10,15,10 / 255).
@@ -1214,11 +1266,6 @@ export default function Mosaic() {
     [] // intentionally empty — we mutate uniforms directly below
   );
 
-  // Sync uniforms when texture or size changes.
-  useEffect(() => {
-    uniforms.uVideo.value = texture;
-  }, [texture, uniforms]);
-
   useEffect(() => {
     uniforms.uPointSize.value = cellPx;
   }, [cellPx, uniforms]);
@@ -1259,7 +1306,10 @@ export default function Mosaic() {
   });
 
   useEffect(() => {
-    if (!texture) {
+    // V2: correctUVs is pinned to webcam status instead of texture.
+    // The mask + face-center alignment still depends on the crop math, so we
+    // must correct UVs once the video dimensions are known (status === "ready").
+    if (status !== "ready") {
       uvsCorrected.current = false;
       return;
     }
@@ -1315,10 +1365,10 @@ export default function Mosaic() {
       video.addEventListener("loadedmetadata", correctUVs, { once: true });
       return () => video.removeEventListener("loadedmetadata", correctUVs);
     }
-  }, [texture, videoRef]);
+  }, [status, videoRef]);
 
   // -------------------------------------------------------------------------
-  // useFrame: update video texture + hand deform uniforms each frame
+  // useFrame: update mask + hand deform uniforms each frame
   // -------------------------------------------------------------------------
 
   // Smoothed hand world-space positions (mutable, not state — no re-render cost).
@@ -1345,16 +1395,15 @@ export default function Mosaic() {
   const motionRef = useRef(0);
 
   useFrame(({ clock }) => {
-    // Keep VideoTexture up-to-date.
-    if (texture) texture.needsUpdate = true;
+    // V2: no VideoTexture to update — video stays MediaPipe-only input.
 
     // Iter 21 — Update elapsed time uniform for tear-band time quantization.
     uniforms.uTime.value = clock.getElapsedTime();
 
-    // ── Iter 18: segmentation mask uniform update ────────────────────────────
+    // ── Segmentation mask uniform update ────────────────────────────────────
     // The DataTexture is allocated and updated (needsUpdate=true) in the rAF
-    // callback inside use-tracking.ts. Here we only need to wire the texture
-    // reference into the shader uniform and flip uMaskActive once it's ready.
+    // callback inside use-tracking.ts. Here we wire the texture reference into
+    // the shader uniform and flip uMaskActive once it's ready.
     const maskTex = maskTextureRef.current;
     if (maskTex) {
       uniforms.uMask.value = maskTex;
@@ -1530,7 +1579,10 @@ export default function Mosaic() {
     uniforms.uMotion.value      = motionRef.current;
   });
 
-  if (!texture) return null;
+  // V2: render guard pinned to webcam status (not texture).
+  // Once the webcam is ready, the mosaic renders; cold-start void is
+  // handled in the fragment shader (uMaskActive < 0.5 → void everywhere).
+  if (status !== "ready") return null;
 
   return (
     <points ref={pointsRef} geometry={geometry}>
