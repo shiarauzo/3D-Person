@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useThree, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import { useWebcamContext } from "@/context/webcam-context";
+import { useTrackingContext } from "@/context/tracking-context";
 import { paletteAsVector3, PALETTE_SIZE } from "@/lib/palette";
 
 /**
@@ -27,6 +28,21 @@ import { paletteAsVector3, PALETTE_SIZE } from "@/lib/palette";
  *                       uCenter + uSlice/(2*UV_ZOOM)]
  *     Sampled V range: [vCenter - 0.5/UV_ZOOM, vCenter + 0.5/UV_ZOOM]
  *   Step 3 — mirror selfie: U = uMax_zoomed - normCol * uSlice_zoomed
+ *
+ * Iteration 16 — Hand-driven deform.
+ *   Landmark → world-space mapping (mirrors the geometry build math):
+ *     1. Mirror: x_screen = 1 - x_mp  (selfie flip)
+ *     2. Crop:   u_crop = (x_screen - uMinZ) / (uSliceZ)
+ *                v_crop = (y_mp     - vMinZ) / (vSliceZ)
+ *     3. World:  world_x = (u_crop - 0.5) * squarePx
+ *                world_y = (0.5 - v_crop) * squarePx   ← V flips (row0=bottom)
+ *   The resulting world_x/world_y live in the same space as the vertex
+ *   position.xy, so distance comparisons in the shader are correct.
+ *
+ *   uHand0/1 (vec2) — smoothed world-space hand center.
+ *   uHandActive0/1 (float) — eased 0→1 when hand enters, 1→0 when it leaves.
+ *   uDeformRadius (float) — world-unit influence radius (~15 % of squarePx).
+ *   uDeformStrength (float) — max push displacement in world units.
  */
 
 // ---------------------------------------------------------------------------
@@ -38,15 +54,87 @@ const vertexShader = /* glsl */ `
 
   uniform float uPointSize;   // size in physical pixels (already DPR-scaled)
 
+  // Iter 16 — Hand deform uniforms.
+  // uHand0/1: smoothed hand world-space position (same coordinate as position.xy).
+  // uHandActive0/1: 0.0 = no hand / faded out, 1.0 = fully active.
+  // uDeformRadius: radial falloff distance in world units.
+  // uDeformStrength: maximum displacement magnitude in world units.
+  uniform vec2  uHand0;
+  uniform vec2  uHand1;
+  uniform float uHandActive0;
+  uniform float uHandActive1;
+  uniform float uDeformRadius;
+  uniform float uDeformStrength;
+
   varying vec2 vUv;
 
   void main() {
     vUv = aUv;
 
+    // Iter 16 — Compute radial push displacement for each active hand.
+    // Uses the XY plane (Z=0 for all vertices), so we work entirely in 2D.
+    //
+    // For each hand:
+    //   delta = vertex.xy - hand.xy
+    //   dist  = length(delta)
+    //   falloff = smoothstep(uDeformRadius, 0.0, dist)
+    //             → 1.0 at the hand centre, 0.0 at uDeformRadius and beyond
+    //   disp  = normalize(delta) * uDeformStrength * falloff * active
+    //
+    // Guard: skip normalize when the vertex is exactly at the hand centre
+    //   (delta == vec2(0)) to avoid NaN / division-by-zero.
+    //
+    // The two contributions are summed. Clamping the total prevents runaway
+    // displacement from two overlapping hands blowing cells too far off-grid.
+
+    vec3 pos = position;
+    vec2 totalDisp = vec2(0.0);
+
+    // Hand 0
+    if (uHandActive0 > 0.001) {
+      vec2 delta0 = pos.xy - uHand0;
+      float dist0 = length(delta0);
+      if (dist0 > 0.001) {
+        float falloff0 = smoothstep(uDeformRadius, 0.0, dist0);
+        totalDisp += normalize(delta0) * uDeformStrength * falloff0 * uHandActive0;
+      }
+    }
+
+    // Hand 1
+    if (uHandActive1 > 0.001) {
+      vec2 delta1 = pos.xy - uHand1;
+      float dist1 = length(delta1);
+      if (dist1 > 0.001) {
+        float falloff1 = smoothstep(uDeformRadius, 0.0, dist1);
+        totalDisp += normalize(delta1) * uDeformStrength * falloff1 * uHandActive1;
+      }
+    }
+
+    // Clamp total displacement to 2× strength so two overlapping hands
+    // can't push a cell more than twice the intended maximum.
+    float dispLen = length(totalDisp);
+    if (dispLen > uDeformStrength * 2.0) {
+      totalDisp = totalDisp / dispLen * uDeformStrength * 2.0;
+    }
+
+    pos.xy += totalDisp;
+
+    // Iter 16 (optional): slightly enlarge point near the hand for emphasis.
+    // activeBlend is 0 at rest, peaks near 1 when close to an active hand.
+    float activeBlend = 0.0;
+    if (uHandActive0 > 0.001) {
+      float dist0 = length(pos.xy - uHand0);
+      activeBlend = max(activeBlend, smoothstep(uDeformRadius, 0.0, dist0) * uHandActive0);
+    }
+    if (uHandActive1 > 0.001) {
+      float dist1 = length(pos.xy - uHand1);
+      activeBlend = max(activeBlend, smoothstep(uDeformRadius, 0.0, dist1) * uHandActive1);
+    }
+
     // position.xy are already in world units matching the ortho camera's
     // visible range [-half, +half]; z=0 keeps points on the near plane.
-    gl_Position  = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    gl_PointSize = uPointSize;
+    gl_Position  = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+    gl_PointSize = uPointSize * (1.0 + 0.35 * activeBlend);
     // NOTE (iter 7 trigger): the WebGL spec allows drivers to clamp
     // gl_PointSize at ALIASED_POINT_SIZE_RANGE[1], typically 64–1024 px.
     // If increasing grid density causes cells to shrink below the driver
@@ -266,11 +354,50 @@ const GRID_H = GRID_W;
 const UV_ZOOM = 1.25;
 
 // ---------------------------------------------------------------------------
+// Iter 16 — Hand deform tuning constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Landmark index to use as the hand's representative position.
+ * 9 = middle-finger MCP (centre of palm), stable across poses.
+ * 0 = wrist (also stable, slightly off-centre).
+ */
+const HAND_LANDMARK_IDX = 9;
+
+/**
+ * uDeformRadius: falloff distance in world units (CSS px in ortho space).
+ * ~18 % of a 1080p canvas ≈ 195 px. Tune up/down to change influence area.
+ */
+const DEFORM_RADIUS_FACTOR = 0.18; // fraction of squarePx
+
+/**
+ * uDeformStrength: maximum displacement in world units.
+ * ~7 % of squarePx gives a clearly visible push without blowing up the figure.
+ */
+const DEFORM_STRENGTH_FACTOR = 0.07; // fraction of squarePx
+
+/**
+ * Lerp speed for smoothing hand position each frame (0 = frozen, 1 = instant).
+ * 0.25 at 60 fps gives ~1/4 of the lag erased per frame → smooth, not sluggish.
+ */
+const HAND_LERP_SPEED = 0.25;
+
+/**
+ * Lerp speed for easing uHandActive in/out when a hand appears/disappears.
+ * Lower = softer fade; higher = snappier.
+ */
+const ACTIVE_LERP_SPEED = 0.15;
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
 export default function Mosaic() {
   const { videoRef, status } = useWebcamContext();
+
+  // Iter 16: read the shared landmarks ref (single detect loop, no duplicate).
+  const { landmarksRef } = useTrackingContext();
+
   const { size, gl } = useThree();
 
   // Square side in CSS pixels (shorter axis so grid fits fully).
@@ -443,6 +570,15 @@ export default function Mosaic() {
           new THREE.Vector3(0xff / 255, 0x9c / 255, 0x2b / 255), // 7 Amber         #ff9c2b
         ],
       },
+      // Iter 16 — Hand deform uniforms.
+      // Initial positions off-screen (will be updated each frame via useFrame).
+      // uHandActive0/1 start at 0.0 (inactive).
+      uHand0:          { value: new THREE.Vector2(0, 0) },
+      uHand1:          { value: new THREE.Vector2(0, 0) },
+      uHandActive0:    { value: 0.0 },
+      uHandActive1:    { value: 0.0 },
+      uDeformRadius:   { value: squarePx * DEFORM_RADIUS_FACTOR },
+      uDeformStrength: { value: squarePx * DEFORM_STRENGTH_FACTOR },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
@@ -457,11 +593,25 @@ export default function Mosaic() {
     uniforms.uPointSize.value = cellPx;
   }, [cellPx, uniforms]);
 
+  // Sync deform radius/strength when squarePx changes (window resize).
+  useEffect(() => {
+    uniforms.uDeformRadius.value   = squarePx * DEFORM_RADIUS_FACTOR;
+    uniforms.uDeformStrength.value = squarePx * DEFORM_STRENGTH_FACTOR;
+  }, [squarePx, uniforms]);
+
   // -------------------------------------------------------------------------
   // Update UV attributes once real video dimensions are known.
   // -------------------------------------------------------------------------
   const pointsRef = useRef<THREE.Points>(null);
   const uvsCorrected = useRef(false);
+
+  // Iter 16 — Store real crop extents so the hand→world mapping stays in sync.
+  // These mirror the UV crop computed in correctUVs() / geometry build.
+  // Initialised with the placeholder 16:9 values; updated once video is ready.
+  const cropRef = useRef({
+    uMinZ: 0, uMaxZ: 0, uSliceZ: 1,
+    vMinZ: 0, vMaxZ: 1, vSliceZ: 1,
+  });
 
   useEffect(() => {
     if (!texture) {
@@ -492,6 +642,9 @@ export default function Mosaic() {
       const uSliceZ   = uMaxZ - uMinZ;
       const vSliceZ   = vMaxZ - vMinZ;
 
+      // Cache crop extents for landmark mapping in useFrame.
+      cropRef.current = { uMinZ, uMaxZ, uSliceZ, vMinZ, vMaxZ, vSliceZ };
+
       const geo = pointsRef.current?.geometry;
       if (!geo) return;
       const uvAttr = geo.attributes.aUv as THREE.BufferAttribute;
@@ -519,11 +672,83 @@ export default function Mosaic() {
     }
   }, [texture, videoRef]);
 
-  // VideoTexture.needsUpdate is set automatically each animation frame
-  // by THREE.VideoTexture when the video is playing, but useFrame also
-  // gives us a hook to force it in case autoUpdate is not triggered.
+  // -------------------------------------------------------------------------
+  // useFrame: update video texture + hand deform uniforms each frame
+  // -------------------------------------------------------------------------
+
+  // Smoothed hand world-space positions (mutable, not state — no re-render cost).
+  const smoothedHand0 = useRef(new THREE.Vector2(0, 0));
+  const smoothedHand1 = useRef(new THREE.Vector2(0, 0));
+  const smoothedActive0 = useRef(0);
+  const smoothedActive1 = useRef(0);
+
   useFrame(() => {
+    // Keep VideoTexture up-to-date.
     if (texture) texture.needsUpdate = true;
+
+    // ── Iter 16: hand-deform uniform update ─────────────────────────────────
+    const result = landmarksRef.current;
+    const hands = result?.landmarks ?? [];
+
+    const { uMinZ, uSliceZ, vMinZ, vSliceZ } = cropRef.current;
+
+    /**
+     * Convert a single MediaPipe landmark (x_mp, y_mp ∈ [0,1], unmirrored,
+     * origin top-left) into mosaic world-space (x,y) using the same transform
+     * chain as the geometry build:
+     *
+     *   1. Mirror (selfie):  x_screen = 1 - x_mp
+     *   2. Map through crop: u_crop = (x_screen - uMinZ) / uSliceZ
+     *                        v_crop = (y_mp      - vMinZ) / vSliceZ
+     *   3. World:            wx = (u_crop - 0.5) * squarePx
+     *                        wy = (0.5 - v_crop) * squarePx
+     *                            ↑ V flips because row0=screen-bottom=y<0
+     *
+     * squarePx is captured from the outer scope (closure over component render).
+     */
+    const lmToWorld = (xMp: number, yMp: number): [number, number] => {
+      const xScreen = 1 - xMp;                         // 1. mirror
+      const uCrop = (xScreen - uMinZ) / uSliceZ;       // 2a. crop U
+      const vCrop = (yMp     - vMinZ) / vSliceZ;       // 2b. crop V
+      const wx = (uCrop - 0.5) * squarePx;             // 3a. world X
+      const wy = (0.5 - vCrop) * squarePx;             // 3b. world Y (V flipped)
+      return [wx, wy];
+    };
+
+    // Hand 0
+    if (hands.length >= 1) {
+      const lm = hands[0][HAND_LANDMARK_IDX];
+      if (lm) {
+        const [tx, ty] = lmToWorld(lm.x, lm.y);
+        // Lerp smoothed position toward the target.
+        smoothedHand0.current.x += (tx - smoothedHand0.current.x) * HAND_LERP_SPEED;
+        smoothedHand0.current.y += (ty - smoothedHand0.current.y) * HAND_LERP_SPEED;
+      }
+      // Ease active weight toward 1.
+      smoothedActive0.current += (1 - smoothedActive0.current) * ACTIVE_LERP_SPEED;
+    } else {
+      // Hand gone: ease active weight toward 0.
+      smoothedActive0.current += (0 - smoothedActive0.current) * ACTIVE_LERP_SPEED;
+    }
+
+    // Hand 1
+    if (hands.length >= 2) {
+      const lm = hands[1][HAND_LANDMARK_IDX];
+      if (lm) {
+        const [tx, ty] = lmToWorld(lm.x, lm.y);
+        smoothedHand1.current.x += (tx - smoothedHand1.current.x) * HAND_LERP_SPEED;
+        smoothedHand1.current.y += (ty - smoothedHand1.current.y) * HAND_LERP_SPEED;
+      }
+      smoothedActive1.current += (1 - smoothedActive1.current) * ACTIVE_LERP_SPEED;
+    } else {
+      smoothedActive1.current += (0 - smoothedActive1.current) * ACTIVE_LERP_SPEED;
+    }
+
+    // Write to shader uniforms (direct mutation, no re-render cost).
+    (uniforms.uHand0.value as THREE.Vector2).copy(smoothedHand0.current);
+    (uniforms.uHand1.value as THREE.Vector2).copy(smoothedHand1.current);
+    uniforms.uHandActive0.value = smoothedActive0.current;
+    uniforms.uHandActive1.value = smoothedActive1.current;
   });
 
   if (!texture) return null;
