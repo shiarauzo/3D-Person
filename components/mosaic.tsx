@@ -57,6 +57,8 @@ const vertexShader = /* glsl */ `
 
 const fragmentShader = /* glsl */ `
   uniform sampler2D uVideo;
+  uniform vec3  uVoidColor;      // near-black void (#0a0f0a)  iter 8
+  uniform float uVoidThreshold;  // luma below this → snap to void  iter 8
 
   varying vec2 vUv;
 
@@ -70,7 +72,15 @@ const fragmentShader = /* glsl */ `
     // with no Three.js color-space conversion. The video stream is natively
     // sRGB; we output it directly. The renderer output colorspace is also sRGB,
     // so there is no double-encode.
-    gl_FragColor = texture2D(uVideo, vUv);
+    vec4 texColor = texture2D(uVideo, vUv);
+
+    // Iter 8 — Void floor: collapse very dark cells to the exact void color so
+    // background noise merges seamlessly with the scene background (#0a0f0a).
+    // Luma via Rec.601 weights (GLSL r169-valid; no nonexistent functions used).
+    float luma = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
+    vec3 finalRgb = luma < uVoidThreshold ? uVoidColor : texColor.rgb;
+
+    gl_FragColor = vec4(finalRgb, 1.0);
   }
 `;
 
@@ -211,8 +221,18 @@ export default function Mosaic() {
   // -------------------------------------------------------------------------
   const uniforms = useMemo<Record<string, THREE.IUniform>>(
     () => ({
-      uVideo:     { value: texture },
-      uPointSize: { value: cellPx },
+      uVideo:         { value: texture },
+      uPointSize:     { value: cellPx },
+      // Iter 8 — void floor uniforms.
+      // uVoidColor carries the RAW sRGB bytes of #0a0f0a (10,15,10 / 255).
+      // THREE.Color(hex) with ColorManagement enabled (r169 default) converts
+      // the value to linear (~0.003/channel), making void cells ~13× too dark.
+      // Using Vector3 with the raw byte ratios bypasses that conversion, so the
+      // shader's direct output matches the scene background exactly.
+      uVoidColor:     { value: new THREE.Vector3(10 / 255, 15 / 255, 10 / 255) },
+      // uVoidThreshold: luma below this snaps to void. 0.12 catches dark
+      // background/edge noise without eating the subject (which is much brighter).
+      uVoidThreshold: { value: 0.12 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
