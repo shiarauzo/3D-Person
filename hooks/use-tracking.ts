@@ -133,6 +133,31 @@ export interface UseTrackingResult {
 /** How often to sync `handCount` state (ms). Avoids per-frame re-renders. */
 const HAND_COUNT_THROTTLE_MS = 1000;
 
+// ---------------------------------------------------------------------------
+// Iter 25 — Per-detector target frame rates (easy to tune)
+// ---------------------------------------------------------------------------
+
+/**
+ * Target detection rate for the hand + pose landmarkers (frames per second).
+ * 30 fps is half the typical render cadence; the mosaic's per-frame lerp
+ * interpolates landmark positions smoothly between detection updates.
+ */
+const HAND_POSE_FPS = 30;
+
+/**
+ * Target detection rate for the selfie segmentation pass (frames per second).
+ * Segmentation is the most expensive detector (~5–15 ms per frame on a typical
+ * laptop GPU via WASM). 18 fps is sufficient because the person silhouette
+ * changes slowly and the mask is bilinearly upscaled by the GPU shader.
+ */
+const SEG_FPS = 18;
+
+/** Derived minimum interval (ms) between hand/pose detect calls. */
+const HAND_POSE_INTERVAL_MS = 1000 / HAND_POSE_FPS; // ~33 ms
+
+/** Derived minimum interval (ms) between segmentation calls. */
+const SEG_INTERVAL_MS = 1000 / SEG_FPS; // ~56 ms
+
 /**
  * Iter 18 — Segmentation mask texture resolution.
  * 256×256 is small enough to upload cheaply every frame while giving the
@@ -244,9 +269,13 @@ export function useTracking({
 
     let cancelled = false;
     let rafId = 0;
-    // Track last timestamp passed to detectForVideo — MediaPipe throws if the
-    // same (or earlier) timestamp is passed twice in VIDEO mode.
-    let lastDetectedTime = -1;
+    // Iter 25 — Per-detector last-called timestamps (ms).
+    // Each detector tracks its own clock independently so the throttle intervals
+    // can differ. MediaPipe requires strictly increasing timestamps per detector
+    // instance; using `now` (performance.now()) guarantees monotonicity as long
+    // as we only call each detector when now > lastXxxTime (enforced below).
+    let lastHandPoseTime = -1;
+    let lastSegTime = -1;
     // Throttle hand-count state updates to avoid flooding React with renders.
     let lastHandCountUpdate = 0;
     // Log detect errors at most once so the console isn't spammed each frame.
@@ -287,17 +316,38 @@ export function useTracking({
         // ── rAF detect loop ────────────────────────────────────────────────
         // Both detectors share the SAME `now` timestamp per frame, satisfying
         // MediaPipe's requirement that timestamps strictly increase per call.
+        // Iter 25 — Segmentation error should also log only once.
+        let segErrorLogged = false;
+
         function detectFrame() {
           if (cancelled) return;
+
+          // Iter 25 — Pause detection when the tab is hidden.
+          // document.hidden is false for the active tab; true when minimised or
+          // switched away. Skipping all detection saves CPU/power with no visual
+          // impact because the user cannot see the canvas anyway.
+          if (document.hidden) {
+            rafId = requestAnimationFrame(detectFrame);
+            return;
+          }
 
           const video = videoRef.current;
           const handles = handlesRef.current;
 
           if (video && handles && video.readyState >= 2 && !video.paused) {
+            // Sample `now` once per rAF tick. It is monotonically increasing
+            // (performance.now() never goes backwards), so passing `now` to any
+            // detector that last ran at `now - interval` satisfies MediaPipe's
+            // strictly-increasing-timestamp requirement.
             const now = performance.now();
 
-            if (now > lastDetectedTime) {
-              // ── Hand detect ─────────────────────────────────────────────
+            // ── Iter 25: Hand + Pose detect (throttled to HAND_POSE_FPS) ──────
+            // Run hand and pose together when their shared interval has elapsed.
+            // Both detectors receive the SAME `now`; each has its own internal
+            // last-timestamp state so passing the same value to two separate
+            // instances is accepted by MediaPipe.
+            if (now - lastHandPoseTime >= HAND_POSE_INTERVAL_MS) {
+              // ── Hand detect ───────────────────────────────────────────────
               try {
                 const handResult = handles.hand.landmarker.detectForVideo(video, now);
                 landmarksRef.current = handResult;
@@ -316,7 +366,7 @@ export function useTracking({
                 }
               }
 
-              // ── Pose detect ─────────────────────────────────────────────
+              // ── Pose detect ───────────────────────────────────────────────
               // Uses the SAME `now` — both calls get an identical strictly-
               // increasing timestamp; MediaPipe accepts this because they are
               // separate detector instances (each tracks its own last-ts state).
@@ -331,25 +381,31 @@ export function useTracking({
                 }
               }
 
-              // ── Iter 18: Segmentation ────────────────────────────────────
-              // segmentForVideo uses a result callback (not a return value).
-              // The callback receives the ImageSegmenterResult synchronously
-              // before the next animation frame in Chrome/Firefox.
-              //
-              // ── Mask upload strategy ─────────────────────────────────────
-              // We use THREE.DataTexture (RedFormat, FloatType, MASK_SIZE²) and
-              // update it in-place each frame. Compared to a CanvasTexture:
-              //   + No canvas 2D context allocation.
-              //   + Direct Float32Array → GPU upload; no per-frame RGBA encode.
-              //   + LinearFilter bilinear upscaling is free on the GPU.
-              //   - Requires explicit needsUpdate = true each frame (done below).
-              //
-              // ── Coordinate note ──────────────────────────────────────────
-              // The MediaPipe mask is in RAW (unmirrored) video space.
-              // aUv values on each mosaic point already encode the mirrored +
-              // cropped + zoomed UV (see mosaic.tsx UV crop math). Sampling
-              // uMask at vUv (= aUv) thus reads the correct raw-space pixel for
-              // each cell — no additional transform is needed in the shader.
+              lastHandPoseTime = now;
+            }
+
+            // ── Iter 25: Segmentation detect (throttled to SEG_FPS) ───────────
+            // Segmentation is the most expensive detector (~5–15 ms/call on WASM).
+            // Running it at ~18 fps instead of 60 fps yields ~3× fewer calls with
+            // no perceptible quality loss — the silhouette changes slowly and the
+            // mosaic shader bilinearly upsamples the 256×256 mask. The callback
+            // API is synchronous (result arrives before next rAF tick in Chromium).
+            //
+            // ── Mask upload strategy ─────────────────────────────────────────
+            // We use THREE.DataTexture (RedFormat, FloatType, MASK_SIZE²) and
+            // update it in-place each call. Compared to a CanvasTexture:
+            //   + No canvas 2D context allocation.
+            //   + Direct Float32Array → GPU upload; no per-frame RGBA encode.
+            //   + LinearFilter bilinear upscaling is free on the GPU.
+            //   - Requires explicit needsUpdate = true each call (done below).
+            //
+            // ── Coordinate note ──────────────────────────────────────────────
+            // The MediaPipe mask is in RAW (unmirrored) video space.
+            // aUv values on each mosaic point already encode the mirrored +
+            // cropped + zoomed UV (see mosaic.tsx UV crop math). Sampling
+            // uMask at vUv (= aUv) thus reads the correct raw-space pixel for
+            // each cell — no additional transform is needed in the shader.
+            if (now - lastSegTime >= SEG_INTERVAL_MS) {
               try {
                 handles.segmenter.segmenter.segmentForVideo(
                   video,
@@ -413,10 +469,13 @@ export function useTracking({
                 );
               } catch (err) {
                 // Log only once to avoid flooding the console.
-                console.error("[tracking] segmentForVideo error:", err);
+                if (!segErrorLogged) {
+                  console.error("[tracking] segmentForVideo error:", err);
+                  segErrorLogged = true;
+                }
               }
 
-              lastDetectedTime = now;
+              lastSegTime = now;
             }
           }
 
