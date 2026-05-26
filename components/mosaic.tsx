@@ -394,6 +394,45 @@ const fragmentShader = /* glsl */ `
   uniform float uFaceAccentBoost;
   uniform float uFaceChaosBias;
 
+  // Iter 24 — Channel-shift corruption (RGB chromatic split).
+  //
+  // Per-channel UV offsets concentrate coloured fringes on the face and tear bands,
+  // reinforcing the datamosh look.  The split is LOCAL, not global — calm body
+  // cells receive ~0 shift; the face core and torn rows get the most displacement.
+  //
+  // uChannelShift:    base magnitude of the per-channel UV offset (fraction of
+  //                   full UV width).  ~0.008 ≈ half a cell at 64 columns.
+  //                   Combines with intensity to produce the effective offset.
+  // uChannelFaceBias: weight multiplier for the face contribution to intensity.
+  //                   Default 1.0 — face contributes its full faceFactor.
+  //                   Raise to 2.0 to double-weight the face region.
+  // uChannelTearBias: weight multiplier for the tear-band contribution.
+  //                   Default 0.6 — torn bands get 60 % of the face weight.
+  //
+  // Effective offset:
+  //   intensity = faceFactor * uChannelFaceBias
+  //             + tearActive * uChannelTearBias
+  //             + uMotion    * 0.15    (small global motion influence)
+  //   off = uChannelShift * clamp(intensity, 0.0, 1.0)
+  //   R samples at sampleUv + vec2(+off, 0.0)
+  //   G samples at sampleUv                         (reference channel)
+  //   B samples at sampleUv + vec2(-off, 0.0)
+  //
+  // Clamped to [0,1] so R and B never read outside the valid texture area.
+  // Because uVideo uses NearestFilter the offset stays blocky/cell-quantized —
+  // the split nudges which palette swatch a cell picks rather than blending.
+  //
+  // Pipeline order:
+  //   channel split → luma (from G) → void gate → palette quantize → accents
+  // The split therefore affects the pre-quantize color, letting it shift which
+  // neon swatch wins and adding hue variety / extra corruption in hot zones.
+  //
+  // Mask + void decisions use sampleUv (not the split offsets) so the
+  // silhouette gate stays aligned — only the sampled RGB color is split.
+  uniform float uChannelShift;
+  uniform float uChannelFaceBias;
+  uniform float uChannelTearBias;
+
   void main() {
     // =========================================================================
     // FRAGMENT PIPELINE ORDER (iter 19):
@@ -536,6 +575,39 @@ const fragmentShader = /* glsl */ `
       }
     }
 
+    // ── Iter 24: face factor (pre-computed here for channel-split + accent) ───
+    // faceFactor is needed both in the channel-split intensity (below) and in
+    // the accent-scatter block (Step 4).  Computing it once avoids redundancy.
+    // Uses the same formula as the iter-23 accent block — see that comment for
+    // full coordinate rationale.
+    float dist_face  = length(vUv - uFaceCenter);
+    float faceFactor = uFaceActive * smoothstep(uFaceRadius, uFaceRadius * 0.4, dist_face);
+
+    // ── Iter 24: Channel-shift RGB split ─────────────────────────────────────
+    // Sample R, G, B from slightly different U positions so coloured fringes
+    // appear.  The offset concentrates on:
+    //   • The face region (faceFactor contribution).
+    //   • Active tear bands (tearActive contribution).
+    //   • A small global motion influence.
+    //
+    // tearActive: 1.0 inside a currently-torn band, 0.0 in calm bands.
+    // This mirrors the tear gate already computed above (uShift != 0).
+    float tearActive = (abs(uShift) > 0.0001) ? 1.0 : 0.0;
+
+    float csIntensity = faceFactor * uChannelFaceBias
+                      + tearActive * uChannelTearBias
+                      + uMotion    * 0.15;
+    csIntensity = clamp(csIntensity, 0.0, 1.0);
+    float off = uChannelShift * csIntensity;
+
+    // Three samples — R and B displaced left/right in U, G is the reference.
+    // Clamp to [0,1] so we never read outside the valid texture area.
+    // NearestFilter ensures the displacement stays blocky / cell-quantized.
+    float r = texture2D(uVideo, vec2(clamp(sampleUv.x + off, 0.0, 1.0), sampleUv.y)).r;
+    float g = texture2D(uVideo, sampleUv).g;
+    float b = texture2D(uVideo, vec2(clamp(sampleUv.x - off, 0.0, 1.0), sampleUv.y)).b;
+    vec4 texColor = vec4(r, g, b, 1.0);
+
     // Iter 6: hard square cells. We do NOT test gl_PointCoord distance so the
     // full point-sprite quad is filled — no circular masking, no discard, no
     // alpha smoothstep. Every fragment within the point gets the same sampled
@@ -550,7 +622,9 @@ const fragmentShader = /* glsl */ `
     //          The mask continues to sample from tearUv (unmodified by sort) so
     //          the silhouette gate stays aligned with the band-shifted geometry,
     //          not the column-held smear position (mask shouldn't smear).
-    vec4 texColor = texture2D(uVideo, sampleUv);
+    // Iter 24: texColor is now a channel-split composite (R/G/B from different
+    //          U offsets).  All downstream stages (luma, void, quantize, accents)
+    //          consume this split color unchanged — the split is pre-quantize.
 
     // ── Step 1: MASK GATE ─────────────────────────────────────────────────────
     // Iter 18/19 — Segmentation mask gate (silhouette boundary).
@@ -657,12 +731,8 @@ const fragmentShader = /* glsl */ `
       // float(GRID_W/GRID_H) must be a literal constant for GLSL ES.
       vec2 cell = floor(vUv * 64.0);
 
-      // Iter 23: compute face-region factor for this cell.
-      // dist: euclidean distance in vUv space from this cell's UV to face center.
-      // smoothstep inner edge = uFaceRadius * 0.4 (storm core), outer = uFaceRadius.
-      // faceFactor is 1 at the core, fades smoothly to 0 at the outer radius.
-      float dist = length(vUv - uFaceCenter);
-      float faceFactor = uFaceActive * smoothstep(uFaceRadius, uFaceRadius * 0.4, dist);
+      // Iter 23: face-region factor (faceFactor already computed above for
+      // channel-split; reuse here so no redundant texture-coordinate math).
 
       // Iter 20: motion-boosted accent probability (body baseline).
       float effAccentAmount = uAccentAmount * (1.0 + uMotion * uMotionAccentBoost);
@@ -808,6 +878,31 @@ const MOTION_ACCENT_BOOST = 1.5;
  * At full motion: strength × 1.6 — noticeably more warp without flying off-grid.
  */
 const MOTION_DEFORM_BOOST = 0.6;
+
+// ---------------------------------------------------------------------------
+// Iter 24 — Channel-shift RGB split constants
+// ---------------------------------------------------------------------------
+
+/**
+ * uChannelShift: base per-channel UV offset magnitude in UV units.
+ * ~0.008 ≈ ½ cell at 64 columns — visible coloured fringe, not a blur.
+ * Keep below 0.02 to avoid the figure losing recognisability.
+ */
+const CHANNEL_SHIFT = 0.008;
+
+/**
+ * uChannelFaceBias: weight for faceFactor contribution to shift intensity.
+ * 1.0 → full faceFactor → maximum shift at the face core.
+ * Raise to 1.5–2.0 to super-concentrate on the face; lower to 0.5 to soften.
+ */
+const CHANNEL_FACE_BIAS = 1.0;
+
+/**
+ * uChannelTearBias: weight for tearActive contribution to shift intensity.
+ * 0.6 → torn bands get 60 % of the face-core shift strength.
+ * Ensures tear bands also exhibit RGB fringes, reinforcing the datamosh look.
+ */
+const CHANNEL_TEAR_BIAS = 0.6;
 
 // ---------------------------------------------------------------------------
 // Iter 23 — Face-density region constants
@@ -1104,6 +1199,16 @@ export default function Mosaic() {
       uFaceActive:      { value: 0.0 },
       uFaceAccentBoost: { value: FACE_ACCENT_BOOST },
       uFaceChaosBias:   { value: FACE_CHAOS_BIAS },
+      // Iter 24 — Channel-shift RGB split uniforms.
+      // uChannelShift:    base UV offset magnitude per channel (fraction of UV width).
+      //   Default 0.008 ≈ ½ cell at 64 columns — clearly visible coloured fringe.
+      // uChannelFaceBias: weight for face contribution to local shift intensity.
+      //   Default 1.0 → faceFactor is used as-is (1.0 at face core → full shift).
+      // uChannelTearBias: weight for tear-band contribution to local shift intensity.
+      //   Default 0.6 → torn rows get 60 % of the face-core shift strength.
+      uChannelShift:    { value: CHANNEL_SHIFT },
+      uChannelFaceBias: { value: CHANNEL_FACE_BIAS },
+      uChannelTearBias: { value: CHANNEL_TEAR_BIAS },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
