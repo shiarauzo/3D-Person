@@ -147,29 +147,39 @@ export interface UseTrackingResult {
 const HAND_COUNT_THROTTLE_MS = 1000;
 
 // ---------------------------------------------------------------------------
-// Iter 25 — Per-detector target frame rates (easy to tune)
+// Perf #8 — Per-detector target frame rates (easy to tune)
 // ---------------------------------------------------------------------------
 
 /**
- * Target detection rate for the hand + pose landmarkers (frames per second).
- * 30 fps is half the typical render cadence; the mosaic's per-frame lerp
- * interpolates landmark positions smoothly between detection updates.
+ * Target detection rate for the hand landmarker (frames per second).
+ * 30 fps keeps hand deform feeling responsive — the mosaic lerps between
+ * detection updates so 30 fps is indistinguishable from 60 fps visually.
  */
-const HAND_POSE_FPS = 30;
+const HAND_FPS = 30;
+
+/**
+ * Target detection rate for the pose landmarker (frames per second).
+ * The face bbox (derived from pose) moves slowly; 15 fps is sufficient and
+ * halves the pose CPU budget vs. the previous shared HAND_POSE_FPS=30.
+ */
+const POSE_FPS = 15;
 
 /**
  * Target detection rate for the selfie segmentation pass (frames per second).
  * Segmentation is the most expensive detector (~5–15 ms per frame on a typical
- * laptop GPU via WASM). 18 fps is sufficient because the person silhouette
+ * laptop GPU via WASM). 15 fps is sufficient because the person silhouette
  * changes slowly and the mask is bilinearly upscaled by the GPU shader.
  */
-const SEG_FPS = 18;
+const SEG_FPS = 15;
 
-/** Derived minimum interval (ms) between hand/pose detect calls. */
-const HAND_POSE_INTERVAL_MS = 1000 / HAND_POSE_FPS; // ~33 ms
+/** Derived minimum interval (ms) between hand detect calls. */
+const HAND_INTERVAL_MS = 1000 / HAND_FPS; // ~33 ms
+
+/** Derived minimum interval (ms) between pose detect calls. */
+const POSE_INTERVAL_MS = 1000 / POSE_FPS; // ~67 ms
 
 /** Derived minimum interval (ms) between segmentation calls. */
-const SEG_INTERVAL_MS = 1000 / SEG_FPS; // ~56 ms
+const SEG_INTERVAL_MS = 1000 / SEG_FPS; // ~67 ms
 
 /**
  * Iter 18 — Segmentation mask texture resolution.
@@ -297,13 +307,20 @@ export function useTracking({
 
     let cancelled = false;
     let rafId = 0;
-    // Iter 25 — Per-detector last-called timestamps (ms).
+    // Perf #8 — Per-detector last-called timestamps (ms).
     // Each detector tracks its own clock independently so the throttle intervals
     // can differ. MediaPipe requires strictly increasing timestamps per detector
     // instance; using `now` (performance.now()) guarantees monotonicity as long
     // as we only call each detector when now > lastXxxTime (enforced below).
-    let lastHandPoseTime = -1;
+    let lastHandTime = -1;
+    let lastPoseTime = -1;
     let lastSegTime = -1;
+    // Perf #8 — Duplicate-frame guard: skip all inference when the video
+    // currentTime hasn't advanced since our last inference pass (the rAF loop
+    // runs at ~60 fps but the webcam delivers ~30 fps — every other tick would
+    // otherwise call detectForVideo on the same frame twice, burning CPU/GPU for
+    // zero new information).
+    let lastVideoTime = -1;
     // Throttle hand-count state updates to avoid flooding React with renders.
     let lastHandCountUpdate = 0;
     // Log detect errors at most once so the console isn't spammed each frame.
@@ -345,9 +362,10 @@ export function useTracking({
         console.log("[tracking] hand + pose landmarkers ready — starting detect loop");
 
         // ── rAF detect loop ────────────────────────────────────────────────
-        // Both detectors share the SAME `now` timestamp per frame, satisfying
-        // MediaPipe's requirement that timestamps strictly increase per call.
-        // Iter 25 — Segmentation error should also log only once.
+        // Each detector runs on its own cadence (HAND_FPS / POSE_FPS / SEG_FPS).
+        // `now` is sampled once per rAF tick from performance.now(), guaranteeing
+        // monotonically increasing timestamps for every detectForVideo call.
+        // Perf #8 — Segmentation error should also log only once.
         let segErrorLogged = false;
 
         function detectFrame() {
@@ -372,12 +390,30 @@ export function useTracking({
             // strictly-increasing-timestamp requirement.
             const now = performance.now();
 
-            // ── Iter 25: Hand + Pose detect (throttled to HAND_POSE_FPS) ──────
-            // Run hand and pose together when their shared interval has elapsed.
-            // Both detectors receive the SAME `now`; each has its own internal
-            // last-timestamp state so passing the same value to two separate
-            // instances is accepted by MediaPipe.
-            if (now - lastHandPoseTime >= HAND_POSE_INTERVAL_MS) {
+            // ── Perf #8: Duplicate-frame guard ────────────────────────────────
+            // The rAF loop fires ~60 fps but the webcam only advances ~30 fps.
+            // When video.currentTime hasn't changed, every detector would be called
+            // on the exact same compressed frame as last tick — identical input,
+            // identical output, pure wasted work. Skip ALL inference and just
+            // reschedule the rAF. We still use `now` (performance.now()) for the
+            // MediaPipe timestamp when we DO call, so monotonicity is preserved.
+            //
+            // NOTE: some browsers (Firefox, some mobile Chromium) coarsen
+            // video.currentTime to ~100ms as a fingerprinting mitigation when
+            // cross-origin isolation headers are absent. There, this guard caps
+            // the effective detection rate to ~10fps. That's still correct (no
+            // starvation, no duplicate inference) — just lower than the configured
+            // HAND/POSE/SEG_FPS targets; the per-frame lerps keep motion smooth.
+            const currentVideoTime = video.currentTime;
+            if (currentVideoTime === lastVideoTime) {
+              rafId = requestAnimationFrame(detectFrame);
+              return;
+            }
+            lastVideoTime = currentVideoTime;
+
+            // ── Perf #8: Hand detect (throttled to HAND_FPS ≈ 30 fps) ─────────
+            // Hands drive the deform effect — kept at 30 fps for responsive feel.
+            if (now - lastHandTime >= HAND_INTERVAL_MS) {
               // ── Hand detect ───────────────────────────────────────────────
               try {
                 const handResult = handles.hand.landmarker.detectForVideo(video, now);
@@ -397,10 +433,16 @@ export function useTracking({
                 }
               }
 
-              // ── Pose detect ───────────────────────────────────────────────
-              // Uses the SAME `now` — both calls get an identical strictly-
-              // increasing timestamp; MediaPipe accepts this because they are
-              // separate detector instances (each tracks its own last-ts state).
+              lastHandTime = now;
+            }
+
+            // ── Perf #8: Pose detect (throttled to POSE_FPS ≈ 15 fps) ─────────
+            // The face bbox (derived from pose) moves slowly; a slower cadence
+            // halves pose CPU vs. hands with no perceptible quality loss.
+            // Each detector gets its own `now` timestamp — monotonicity is still
+            // guaranteed (performance.now() only goes forward) and each detector
+            // instance tracks its own last-timestamp state internally.
+            if (now - lastPoseTime >= POSE_INTERVAL_MS) {
               try {
                 const poseResult = handles.pose.landmarker.detectForVideo(video, now);
                 poseRef.current = poseResult;
@@ -412,12 +454,12 @@ export function useTracking({
                 }
               }
 
-              lastHandPoseTime = now;
+              lastPoseTime = now;
             }
 
-            // ── Iter 25: Segmentation detect (throttled to SEG_FPS) ───────────
+            // ── Perf #8: Segmentation detect (throttled to SEG_FPS ≈ 15 fps) ──
             // Segmentation is the most expensive detector (~5–15 ms/call on WASM).
-            // Running it at ~18 fps instead of 60 fps yields ~3× fewer calls with
+            // Running it at 15 fps instead of 60 fps yields 4× fewer calls with
             // no perceptible quality loss — the silhouette changes slowly and the
             // mosaic shader bilinearly upsamples the 256×256 mask. The callback
             // API is synchronous (result arrives before next rAF tick in Chromium).
