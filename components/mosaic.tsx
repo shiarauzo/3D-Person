@@ -186,6 +186,22 @@ const fragmentShader = /* glsl */ `
   uniform vec3  uVoidColor;       // near-black void (#0a0f0a)  iter 8
   uniform float uVoidThreshold;   // base luma threshold; below this → snap to void  iter 8/12
 
+  // Iter 21 — Horizontal tear bands (pixel-sort / datamosh signature).
+  // uTime:            elapsed seconds (updated every frame in useFrame).
+  // uTearBands:       number of horizontal band rows (~24-40).
+  // uTearProbability: fraction of bands that actually tear (~0.20-0.35).
+  // uTearAmount:      maximum horizontal UV shift magnitude (~0.02-0.06).
+  //
+  // The tear is purely in the fragment stage: BEFORE any texture sample we
+  // compute a per-band U offset and apply it to a new tearUv.  Both uVideo
+  // and uMask are sampled from tearUv so color + mask travel together.
+  // The shift is constant across the whole band (no smoothstep) → blocky.
+  // Tear amplitude is scaled by uMotion so movement drives more tearing.
+  uniform float uTime;
+  uniform float uTearBands;
+  uniform float uTearProbability;
+  uniform float uTearAmount;
+
   // Iter 18 — Segmentation mask uniforms.
   // Iter 19 — uMaskGamma for silhouette tightening (hard-step only, no smoothing).
   //
@@ -359,6 +375,47 @@ const fragmentShader = /* glsl */ `
     //     (magenta/cyan/blue/red/amber) for glitch variety.
     // =========================================================================
 
+    // ── Iter 21: Horizontal tear bands ───────────────────────────────────────
+    // Compute a per-band U shift (pixel-sort / datamosh look).
+    //
+    // Band index: quantize vUv.y into uTearBands equal horizontal slices.
+    //   bandIdx = floor(vUv.y * uTearBands)  →  one integer per band row.
+    //
+    // Time quantization: floor(uTime * 4.0) changes ~4 times/sec so bands
+    //   snap to new positions occasionally without continuous smearing.
+    //   At uTime fractions the band set is STABLE — bands hold position.
+    //
+    // Band hash: two independent hashes from (bandIdx, quantizedTime):
+    //   h1 — probability gate:  tear only when h1 < uTearProbability
+    //   h2 — signed direction:  shift = (h2 * 2.0 - 1.0) * maxShift
+    //        mapped to [-1,+1] then scaled by uTearAmount so left/right
+    //        tears are equally likely, keeping the silhouette balanced.
+    //
+    // Motion scaling: maxShift = uTearAmount * (1 + uMotion * 2.0) so calm
+    //   scenes show subtle displacement, fast motion amplifies tearing.
+    //
+    // tearUv replaces vUv for ALL subsequent texture samples (video + mask)
+    //   so color and mask always shift together — torn rows stay gated.
+    // The U component is clamped to [0,1] to stay within valid UV space.
+    float quantizedTime = floor(uTime * 4.0);
+    float bandIdx       = floor(vUv.y * uTearBands);
+
+    // Gate hash: decides if this band tears.
+    float hGate = fract(sin(dot(vec2(bandIdx, quantizedTime),
+                                vec2(12.9898, 78.233))) * 43758.5453);
+    // Direction hash: independent seed via offset constants.
+    float hDir  = fract(sin(dot(vec2(bandIdx + 100.0, quantizedTime + 37.0),
+                                vec2(39.3468, 19.7317))) * 27831.9182);
+
+    float maxShift = uTearAmount * (1.0 + uMotion * 2.0);
+    float uShift   = (hGate < uTearProbability)
+                       ? (hDir * 2.0 - 1.0) * maxShift
+                       : 0.0;
+
+    // tearUv: shifted U, unchanged V.  Clamp U inside [0,1] so we never
+    // read outside the texture (wraps would smear background into the figure).
+    vec2 tearUv = vec2(clamp(vUv.x + uShift, 0.0, 1.0), vUv.y);
+
     // Iter 6: hard square cells. We do NOT test gl_PointCoord distance so the
     // full point-sprite quad is filled — no circular masking, no discard, no
     // alpha smoothstep. Every fragment within the point gets the same sampled
@@ -368,7 +425,8 @@ const fragmentShader = /* glsl */ `
     // with no Three.js color-space conversion. The video stream is natively
     // sRGB; we output it directly. The renderer output colorspace is also sRGB,
     // so there is no double-encode.
-    vec4 texColor = texture2D(uVideo, vUv);
+    // Iter 21: sample video from tearUv (shifted) instead of vUv.
+    vec4 texColor = texture2D(uVideo, tearUv);
 
     // ── Step 1: MASK GATE ─────────────────────────────────────────────────────
     // Iter 18/19 — Segmentation mask gate (silhouette boundary).
@@ -395,7 +453,8 @@ const fragmentShader = /* glsl */ `
     //        → 1.0 when prob >= threshold (person → continue)
     //     No interpolation anywhere in this path.
     if (uMaskActive > 0.5) {
-      float rawProb  = texture2D(uMask, vUv).r;
+      // Iter 21: sample mask from tearUv so mask gate travels with the video shift.
+      float rawProb  = texture2D(uMask, tearUv).r;
       // Iter 19: gamma on raw probability to tighten/loosen silhouette edge.
       // pow(x, 1.0) = x (identity); pow(x, 2.0) shrinks borderline edge pixels.
       float maskProb = pow(rawProb, uMaskGamma);
@@ -800,6 +859,15 @@ export default function Mosaic() {
       uMotion:            { value: 0.0 },
       uMotionAccentBoost: { value: MOTION_ACCENT_BOOST },
       uMotionDeformBoost: { value: MOTION_DEFORM_BOOST },
+      // Iter 21 — Horizontal tear-band uniforms.
+      // uTime:            elapsed seconds, updated every frame.
+      // uTearBands:       number of horizontal band rows.
+      // uTearProbability: fraction of bands that tear (gate threshold).
+      // uTearAmount:      max horizontal UV shift at idle (motion scales it up).
+      uTime:            { value: 0.0 },
+      uTearBands:       { value: 30.0 },
+      uTearProbability: { value: 0.25 },
+      uTearAmount:      { value: 0.035 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
@@ -912,9 +980,12 @@ export default function Mosaic() {
   // Updated in-place via decay + instantaneous max strategy.
   const motionRef = useRef(0);
 
-  useFrame(() => {
+  useFrame(({ clock }) => {
     // Keep VideoTexture up-to-date.
     if (texture) texture.needsUpdate = true;
+
+    // Iter 21 — Update elapsed time uniform for tear-band time quantization.
+    uniforms.uTime.value = clock.getElapsedTime();
 
     // ── Iter 18: segmentation mask uniform update ────────────────────────────
     // The DataTexture is allocated and updated (needsUpdate=true) in the rAF
