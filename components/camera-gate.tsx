@@ -1,13 +1,13 @@
 "use client";
 
-import { useWebcam } from "@/hooks/use-webcam";
+import { useWebcamContext } from "@/context/webcam-context";
 
 export default function CameraGate() {
-  const { videoRef, status, error, start } = useWebcam();
+  const { videoRef, status, error, start } = useWebcamContext();
 
   return (
     <>
-      {/* Hidden video — always mounted so iter 4-5 mosaic can sample it */}
+      {/* Hidden video — always mounted so the mosaic can sample it */}
       {/* biome-ignore lint/a11y/useMediaCaption: pixel-source element, no captions */}
       <video
         ref={videoRef}
