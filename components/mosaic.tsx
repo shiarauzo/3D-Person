@@ -5,7 +5,9 @@ import { useThree, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import { useWebcamContext } from "@/context/webcam-context";
 import { useTrackingContext } from "@/context/tracking-context";
+import { useControlsContext } from "@/context/controls-context";
 import { paletteAsVector3, PALETTE_SIZE } from "@/lib/palette";
+import { CONTROLS_DEFAULTS } from "@/lib/controls-defaults";
 
 // ---------------------------------------------------------------------------
 // Iter 18 — Mask sampling threshold
@@ -953,6 +955,9 @@ export default function Mosaic() {
   // Iter 23: read faceBboxRef for face-density region.
   const { landmarksRef, maskTextureRef, faceBboxRef } = useTrackingContext();
 
+  // Iter 29 — Live controls context.
+  const { controls } = useControlsContext();
+
   const { size, gl } = useThree();
 
   // Square side in CSS pixels (shorter axis so grid fits fully).
@@ -1087,11 +1092,8 @@ export default function Mosaic() {
       // shader's direct output matches the scene background exactly.
       uVoidColor:     { value: new THREE.Vector3(10 / 255, 15 / 255, 10 / 255) },
       // uVoidThreshold: base luma below which a cell snaps to void.
-      // Iter 12: raised from 0.12 → 0.20 so mid-dark body shadows (lower chest)
-      // also collapse to void black, punching characteristic holes through the
-      // figure per visual-reference.md. Keep below ~0.30 to avoid eating the
-      // whole figure; the lower-body bias handles the spatial gradient.
-      uVoidThreshold: { value: 0.20 },
+      // Iter 12: raised from 0.12 → 0.20. Iter 29: driven by CONTROLS_DEFAULTS.
+      uVoidThreshold: { value: CONTROLS_DEFAULTS.voidThreshold },
       // Iter 12 — Lower-body void bias uniforms.
       // COORDINATE NOTE: vUv.y ≈ 0.10 = face/top, vUv.y ≈ 0.90 = lower chest.
       // uVoidLowerBias: max additional threshold added for cells at the very
@@ -1114,16 +1116,10 @@ export default function Mosaic() {
       // Iter 10 — uPaletteMix = 1.0 activates full palette quantization.
       // Every non-void cell is snapped to its nearest neon swatch; no mid-tones.
       uPaletteMix:    { value: 1.0 },
-      // Iter 11 — Lime bias: 0.0 = no bias (pure nearest-color); 1.0 = maximum
-      // pull toward green swatches for mid-luma cells (may over-green everything).
-      // 0.5 is the tuned default: body mass reads lime while accents survive.
-      // Green swatch indices: 1 = Acid Lime (#c8f000), 2 = Toxic Green (#39ff5a)
-      // — matches lib/palette.ts PALETTE_HEXES ordering.
-      uLimeBias:      { value: 0.5 },
-      // Iter 13 — Accent scatter uniforms.
-      // uAccentAmount: probability a non-void cell becomes an accent pop.
-      // 0.12 = ~12 % of body cells → minority scatter, not a uniform blob.
-      uAccentAmount:  { value: 0.12 },
+      // Iter 11 — Lime bias. Iter 29: driven by CONTROLS_DEFAULTS.
+      uLimeBias:      { value: CONTROLS_DEFAULTS.limeBias },
+      // Iter 13 — Accent scatter. Iter 29: driven by CONTROLS_DEFAULTS.
+      uAccentAmount:  { value: CONTROLS_DEFAULTS.accentAmount },
       // uAccents: raw sRGB vec3 for palette indices 3..7 (magenta→amber).
       // Parsed manually (same reason as uVoidColor: avoid ColorManagement shift).
       uAccents: {
@@ -1177,8 +1173,9 @@ export default function Mosaic() {
       // uTearAmount:      max horizontal UV shift at idle (motion scales it up).
       uTime:            { value: 0.0 },
       uTearBands:       { value: 30.0 },
-      uTearProbability: { value: 0.25 },
-      uTearAmount:      { value: 0.035 },
+      // Iter 29: tear knobs driven by CONTROLS_DEFAULTS.
+      uTearProbability: { value: CONTROLS_DEFAULTS.tearProbability },
+      uTearAmount:      { value: CONTROLS_DEFAULTS.tearAmount },
       // Iter 22 — Pixel-sort streak uniforms.
       // uSortThreshold: luma above which a cell is eligible to streak (bright-run
       //   trigger, matching Asendorf light-sort behavior). Default 0.55.
@@ -1207,7 +1204,8 @@ export default function Mosaic() {
       uFaceCenter:      { value: new THREE.Vector2(0.5, 0.35) },
       uFaceRadius:      { value: 0.25 },
       uFaceActive:      { value: 0.0 },
-      uFaceAccentBoost: { value: FACE_ACCENT_BOOST },
+      // Iter 29: faceAccentBoost driven by CONTROLS_DEFAULTS.
+      uFaceAccentBoost: { value: CONTROLS_DEFAULTS.faceAccentBoost },
       uFaceChaosBias:   { value: FACE_CHAOS_BIAS },
       // Iter 24 — Channel-shift RGB split uniforms.
       // uChannelShift:    base UV offset magnitude per channel (fraction of UV width).
@@ -1238,6 +1236,21 @@ export default function Mosaic() {
     uniforms.uDeformRadius.value   = squarePx * DEFORM_RADIUS_FACTOR;
     uniforms.uDeformStrength.value = squarePx * DEFORM_STRENGTH_FACTOR;
   }, [squarePx, uniforms]);
+
+  // Iter 29 — Sync live control values → shader uniforms.
+  // Called whenever any control value changes (user-driven, infrequent).
+  // deformStrength is stored as a fraction of squarePx (matching DEFORM_STRENGTH_FACTOR)
+  // so the world-unit value accounts for the current canvas size.
+  // Motion/face modulation still multiplies on top in useFrame — unaffected.
+  useEffect(() => {
+    uniforms.uVoidThreshold.value   = controls.voidThreshold;
+    uniforms.uTearProbability.value = controls.tearProbability;
+    uniforms.uTearAmount.value      = controls.tearAmount;
+    uniforms.uAccentAmount.value    = controls.accentAmount;
+    uniforms.uLimeBias.value        = controls.limeBias;
+    uniforms.uDeformStrength.value  = squarePx * controls.deformStrength;
+    uniforms.uFaceAccentBoost.value = controls.faceAccentBoost;
+  }, [controls, uniforms, squarePx]);
 
   // -------------------------------------------------------------------------
   // Update UV attributes once real video dimensions are known.
