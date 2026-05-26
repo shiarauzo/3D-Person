@@ -47,3 +47,28 @@ main {
   font-size: 12px;
   opacity: 0.5;
 }
+
+/* iter-02 debug controls — removed in iter-03 */
+.debug-btn {
+  padding: 6px 14px;
+  font-size: 11px;
+  font-family: ui-monospace, "Geist Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  background: rgba(255, 255, 255, 0.06);
+  color: #e7e9ee;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.debug-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.debug-label {
+  font-size: 11px;
+  font-family: ui-monospace, "Geist Mono", monospace;
+  letter-spacing: 0.08em;
+  opacity: 0.7;
+}
