@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 export type WebcamStatus = "idle" | "requesting" | "ready" | "denied" | "error";
 
 export interface UseWebcamReturn {
-  videoRef: React.RefObject<HTMLVideoElement>;
+  videoRef: React.RefObject<HTMLVideoElement | null>;
   status: WebcamStatus;
   error: string | null;
   start: () => Promise<void>;

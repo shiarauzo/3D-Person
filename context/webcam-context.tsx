@@ -4,7 +4,7 @@ import { createContext, useContext, type ReactNode } from "react";
 import { useWebcam, type WebcamStatus } from "@/hooks/use-webcam";
 
 interface WebcamContextValue {
-  videoRef: React.RefObject<HTMLVideoElement>;
+  videoRef: React.RefObject<HTMLVideoElement | null>;
   status: WebcamStatus;
   error: string | null;
   start: () => Promise<void>;
