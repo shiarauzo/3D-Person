@@ -24,6 +24,7 @@ import * as THREE from "three";
 import { useWebcamContext } from "@/context/webcam-context";
 import { useTrackingContext } from "@/context/tracking-context";
 import { useControlsContext } from "@/context/controls-context";
+import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import vertexShader from "@/shaders/mosaic.vert";
 import fragmentShader from "@/shaders/mosaic.frag";
 import { useMosaicGeometry, GRID_W } from "@/hooks/use-mosaic-geometry";
@@ -78,6 +79,7 @@ export default function Mosaic() {
   const { videoRef, status } = useWebcamContext();
   const { landmarksRef, maskTextureRef, faceBboxRef } = useTrackingContext();
   const { controls } = useControlsContext();
+  const reducedMotion = useReducedMotion();
 
   const { size, gl } = useThree();
 
@@ -123,6 +125,24 @@ export default function Mosaic() {
   useFrame(({ clock }) => {
     // Iter 21 — Elapsed time for tear-band quantization.
     uniforms.uTime.value = clock.getElapsedTime();
+
+    // Task 5 — prefers-reduced-motion: override drift-speed and tear activity.
+    // We mutate the uniforms directly here rather than in a useEffect so the
+    // override fires every frame and can't be clobbered by the controls sync.
+    // uReducedMotion is also set via useEffect in use-mosaic-uniforms for the
+    // initial state, but the per-frame override below is the authoritative path.
+    if (reducedMotion) {
+      // Near-zero drift: the noise lattice barely moves, making the piece static.
+      uniforms.uNoiseDrift.value     = 0.002;
+      // Suppress tear bands: rare, subtle drift only.
+      uniforms.uTearProbability.value = 0.02;
+      // Hand deform still active (intentional — user gesture is not "motion" in
+      // the OS sense; it's a direct, intentional interaction).
+    } else {
+      // Restore to user-controlled values.
+      uniforms.uNoiseDrift.value      = controls.noiseDrift;
+      uniforms.uTearProbability.value = controls.tearProbability;
+    }
 
     // ── Segmentation mask ──────────────────────────────────────────────────
     const maskTex = maskTextureRef.current;

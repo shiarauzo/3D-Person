@@ -33,7 +33,7 @@
  *   - The mask is in the same RAW space (flipY=true matches real mask).
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import type { UseTrackingResult, FaceBbox } from "@/hooks/use-tracking";
 import type { HandLandmarkerResult, PoseLandmarkerResult } from "@mediapipe/tasks-vision";
@@ -152,6 +152,8 @@ export function useDemoTracking(): UseTrackingResult {
   });
   const maskTextureRef = useRef<THREE.DataTexture | null>(null);
   const [handCount] = useState(1);
+  // Demo mode: models are never loaded; report "ready" immediately.
+  const retryInit = useCallback(() => {}, []);
 
   // Allocate the mask texture on mount; dispose on unmount.
   useEffect(() => {
@@ -209,5 +211,5 @@ export function useDemoTracking(): UseTrackingResult {
     };
   }, []);
 
-  return { landmarksRef, handCount, poseRef, faceBboxRef, maskTextureRef };
+  return { landmarksRef, handCount, poseRef, faceBboxRef, maskTextureRef, initStatus: "ready", retryInit };
 }

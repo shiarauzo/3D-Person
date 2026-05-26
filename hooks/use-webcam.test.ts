@@ -52,11 +52,16 @@ function classifyWebcamError(err: unknown): ClassifiedError {
 // Pure extract: status transition on start()
 // ---------------------------------------------------------------------------
 // The initial transition when start() is called (before the async part):
-//   idle → requesting (if navigator is available)
-//   idle → error (if navigator.mediaDevices is not available — SSR guard)
+//   idle → requesting   (navigator.mediaDevices.getUserMedia is available)
+//   idle → unsupported  (navigator is undefined OR getUserMedia is missing — SSR/HTTP guard)
+//
+// Mirrors the guard in useWebcam.start():
+//   if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+//     setStatus("unsupported");
+//   }
 
-function classifyStartTransition(navigatorAvailable: boolean): WebcamStatus {
-  if (!navigatorAvailable) return "error";
+function classifyStartTransition(getUserMediaAvailable: boolean): WebcamStatus {
+  if (!getUserMediaAvailable) return "unsupported";
   return "requesting";
 }
 
@@ -118,12 +123,12 @@ describe("classifyWebcamError", () => {
 // ---------------------------------------------------------------------------
 
 describe("classifyStartTransition", () => {
-  it("navigator available → transitions to 'requesting'", () => {
+  it("getUserMedia available → transitions to 'requesting'", () => {
     expect(classifyStartTransition(true)).toBe("requesting");
   });
 
-  it("navigator unavailable (SSR) → transitions to 'error'", () => {
-    expect(classifyStartTransition(false)).toBe("error");
+  it("getUserMedia unavailable (SSR / HTTP / unsupported browser) → transitions to 'unsupported'", () => {
+    expect(classifyStartTransition(false)).toBe("unsupported");
   });
 });
 
