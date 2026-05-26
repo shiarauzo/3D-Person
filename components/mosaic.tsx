@@ -6,17 +6,26 @@ import * as THREE from "three";
 import { useWebcamContext } from "@/context/webcam-context";
 
 /**
- * Iteration 5 — Points grid sampling the video.
+ * Iteration 7 — Grid density + framing tune.
  *
- * Replaces the iter-4 textured plane with a THREE.Points grid.
- * Each point samples the video texture at its own UV via a ShaderMaterial,
- * producing a coarse, blocky mosaic reconstruction of the live feed.
+ * - Grid is 64×64 (GRID_W single source of truth; GRID_H derived).
+ *   cellPx = squarePx / GRID_W * dpr * 1.02, keeping hard-square tiling.
+ * - UV_ZOOM crops into the center of the video so a typical seated webcam
+ *   framing (head near top, shoulders visible) fills ~70 % of the frame
+ *   height, matching docs/visual-reference.md layout spec.
  *
- * UV crop math (same as iter-4, 16:9 → 1:1 centered, mirrored selfie):
- *   uSlice = 1 / aspect
- *   uPad   = (1 - uSlice) / 2
- *   Mirrored: point U = uMax - normalizedCol * uSlice
- *             point V = normalizedRow (0 bottom → 1 top)
+ * UV crop math (16:9 → 1:1 centered square, mirrored selfie, then zoom):
+ *   Step 1 — 16:9 → 1:1 crop:
+ *     uSlice = 1 / aspect          (width of the 1:1 window in UV space)
+ *     uPad   = (1 - uSlice) / 2   (left dead band)
+ *   Step 2 — zoom (UV_ZOOM > 1 shrinks the sampled region → subject larger):
+ *     For each axis the sampled half-width = 0.5 / UV_ZOOM
+ *     uCenter = uPad + uSlice * 0.5   (horizontal center of the crop)
+ *     vCenter = 0.5                    (vertical center)
+ *     Sampled U range: [uCenter - uSlice/(2*UV_ZOOM),
+ *                       uCenter + uSlice/(2*UV_ZOOM)]
+ *     Sampled V range: [vCenter - 0.5/UV_ZOOM, vCenter + 0.5/UV_ZOOM]
+ *   Step 3 — mirror selfie: U = uMax_zoomed - normCol * uSlice_zoomed
  */
 
 // ---------------------------------------------------------------------------
@@ -66,10 +75,21 @@ const fragmentShader = /* glsl */ `
 `;
 
 // ---------------------------------------------------------------------------
-// Grid constants
+// Grid constants — single source of truth
 // ---------------------------------------------------------------------------
 
-const GRID_W = 60;
+/** Number of cells across (and down — grid is always square). 40–80 range. */
+const GRID_W = 64;
+/** Derived: same as GRID_W so cells are square. */
+const GRID_H = GRID_W;
+
+/**
+ * UV zoom factor. > 1 samples a smaller region of the source video,
+ * making the subject appear larger inside the square canvas.
+ * 1.25 ≈ 25 % crop inward on each axis — a typical seated-webcam framing
+ * (head+shoulders) fills ~70 % of the frame height per visual-reference.md.
+ */
+const UV_ZOOM = 1.25;
 
 // ---------------------------------------------------------------------------
 // Component
@@ -121,7 +141,7 @@ export default function Mosaic() {
   const geometry = useMemo(() => {
     const geo = new THREE.BufferGeometry();
 
-    const count = GRID_W * GRID_W;
+    const count = GRID_W * GRID_H;
     const positions = new Float32Array(count * 3);
     const uvs = new Float32Array(count * 2);
 
@@ -129,20 +149,31 @@ export default function Mosaic() {
     // The grid spans squarePx × squarePx centred at origin.
     const half = squarePx / 2;
     const stepX = squarePx / GRID_W;
-    const stepY = squarePx / GRID_W;
+    const stepY = squarePx / GRID_H;
 
-    // UV crop math: 16:9 video → centered 1:1 square, mirrored.
-    // We use placeholder aspect=16/9 here; it is corrected each frame via
-    // the uVideo uniform itself — the GPU samples the actual texture, so
-    // the UV attribute only needs to encode the final correct values.
-    // We pre-compute with fallback aspect 16/9 and update once metadata loads.
+    // UV crop math: 16:9 video → centered 1:1 square, mirrored, then UV_ZOOM.
+    // Placeholder aspect 16/9 — corrected once real video dimensions are known
+    // (see correctUVs() below). The formula is the same in both places.
     const aspect = 16 / 9;
-    const uSlice = 1 / aspect;
-    const uPad = (1 - uSlice) / 2;
-    const uMax = 1 - uPad;    // right edge of the square crop (mirrored start)
+    const uSlice = 1 / aspect;          // width of the 1:1 crop window in UV
+    const uPad   = (1 - uSlice) / 2;   // left dead band
+
+    // Zoom: sample a 1/UV_ZOOM sub-region centered on the crop center.
+    const uCenter    = uPad + uSlice * 0.5;    // horizontal center of crop
+    const vCenter    = 0.5;                     // vertical center (symmetric)
+    const uHalf      = uSlice / (2 * UV_ZOOM); // zoomed half-width (U axis)
+    const vHalf      = 0.5 / UV_ZOOM;          // zoomed half-height (V axis)
+
+    // Zoomed crop extents.
+    const uMinZ = uCenter - uHalf;  // left edge after zoom
+    const uMaxZ = uCenter + uHalf;  // right edge after zoom (mirrored start)
+    const vMinZ = vCenter - vHalf;
+    const vMaxZ = vCenter + vHalf;
+    const uSliceZ = uMaxZ - uMinZ;
+    const vSliceZ = vMaxZ - vMinZ;
 
     let idx = 0;
-    for (let row = 0; row < GRID_W; row++) {
+    for (let row = 0; row < GRID_H; row++) {
       for (let col = 0; col < GRID_W; col++) {
         // World position: step from bottom-left corner, centre of each cell.
         const x = -half + stepX * (col + 0.5);
@@ -154,14 +185,13 @@ export default function Mosaic() {
 
         // Normalized grid coords [0, 1].
         const normCol = col / (GRID_W - 1);
-        const normRow = row / (GRID_W - 1);
+        const normRow = row / (GRID_H - 1);
 
         // V: 0 = bottom, 1 = top (video origin at top → flip V).
-        const v = 1 - normRow;
+        const v = vMinZ + (1 - normRow) * vSliceZ;
 
-        // U: mirrored (selfie). Without mirror: uMin + normCol * uSlice.
-        // Mirrored: uMax - normCol * uSlice.
-        const u = uMax - normCol * uSlice;
+        // U: mirrored selfie — right-to-left across the zoomed U window.
+        const u = uMaxZ - normCol * uSliceZ;
 
         uvs[idx * 2 + 0] = u;
         uvs[idx * 2 + 1] = v;
@@ -217,22 +247,32 @@ export default function Mosaic() {
       const vh = video.videoHeight;
       if (!vw || !vh) return;
 
-      const aspect = vw / vh;
-      const uSlice = 1 / aspect;
-      const uPad = (1 - uSlice) / 2;
-      const uMax = 1 - uPad;
+      // Same UV_ZOOM crop math as the initial geometry build, using real aspect.
+      const aspect    = vw / vh;
+      const uSlice    = 1 / aspect;
+      const uPad      = (1 - uSlice) / 2;
+      const uCenter   = uPad + uSlice * 0.5;
+      const vCenter   = 0.5;
+      const uHalf     = uSlice / (2 * UV_ZOOM);
+      const vHalf     = 0.5 / UV_ZOOM;
+      const uMinZ     = uCenter - uHalf;
+      const uMaxZ     = uCenter + uHalf;
+      const vMinZ     = vCenter - vHalf;
+      const vMaxZ     = vCenter + vHalf;
+      const uSliceZ   = uMaxZ - uMinZ;
+      const vSliceZ   = vMaxZ - vMinZ;
 
       const geo = pointsRef.current?.geometry;
       if (!geo) return;
       const uvAttr = geo.attributes.aUv as THREE.BufferAttribute;
 
       let idx = 0;
-      for (let row = 0; row < GRID_W; row++) {
+      for (let row = 0; row < GRID_H; row++) {
         for (let col = 0; col < GRID_W; col++) {
           const normCol = col / (GRID_W - 1);
-          const normRow = row / (GRID_W - 1);
-          const v = 1 - normRow;
-          const u = uMax - normCol * uSlice;
+          const normRow = row / (GRID_H - 1);
+          const v = vMinZ + (1 - normRow) * vSliceZ;
+          const u = uMaxZ - normCol * uSliceZ;
           uvAttr.setXY(idx, u, v);
           idx++;
         }
