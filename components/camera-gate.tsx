@@ -1,9 +1,14 @@
 "use client";
 
 import { useWebcamContext } from "@/context/webcam-context";
+import { useTracking } from "@/hooks/use-tracking";
 
 export default function CameraGate() {
   const { videoRef, status, error, start } = useWebcamContext();
+
+  // Bootstrap MediaPipe tracking once the camera is live.
+  // Iter 14: init + teardown only. Per-frame detect loop added in iter 15.
+  useTracking({ videoRef, enabled: status === "ready" });
 
   return (
     <>
