@@ -1,0 +1,49 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  background: #0b0d12;
+  color: #e7e9ee;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  overflow: hidden;
+}
+
+#__next,
+main {
+  height: 100%;
+}
+
+.canvas-wrap {
+  position: fixed;
+  inset: 0;
+}
+
+.overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  padding: 28px 32px;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.overlay h1 {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+
+.overlay p {
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.5;
+}
