@@ -4,11 +4,13 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "predev": "node scripts/copy-mediapipe-assets.mjs",
     "build": "next build",
-    "prebuild": "node scripts/validate-glsl.mjs",
+    "prebuild": "node scripts/copy-mediapipe-assets.mjs && node scripts/validate-glsl.mjs",
     "start": "next start",
     "lint": "next lint",
     "validate:glsl": "node scripts/validate-glsl.mjs",
+    "assets": "node scripts/copy-mediapipe-assets.mjs",
     "test": "bun test"
   },
   "dependencies": {
