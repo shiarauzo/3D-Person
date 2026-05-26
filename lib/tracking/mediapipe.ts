@@ -37,13 +37,17 @@ const POSE_MODEL_URL =
  *
  * URL source:
  *   https://storage.googleapis.com/mediapipe-models/image_segmenter/
- *     selfie_segmenter/float16/latest/selfie_segmenter.task
+ *     selfie_segmenter/float16/latest/selfie_segmenter.tflite
+ *
+ * NOTE: the ImageSegmenter model ships as a `.tflite` asset (unlike the
+ * HandLandmarker / PoseLandmarker, which use `.task` bundles). Using `.task`
+ * here returns a 404.
  *
  * The "selfie_multiclass" variant (5-class hair/skin/clothing/etc.) is NOT
  * used here — we only need a binary person vs. background probability.
  */
 const SEGMENTER_MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.task";
+  "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
 
 // ─── Shared types ───────────────────────────────────────────────────────────
 
