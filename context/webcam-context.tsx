@@ -11,7 +11,8 @@ interface WebcamContextValue {
   stop: () => void;
 }
 
-const WebcamContext = createContext<WebcamContextValue | null>(null);
+// Exported so DemoWebcamProvider can share the same context object.
+export const WebcamContext = createContext<WebcamContextValue | null>(null);
 
 export function WebcamProvider({ children }: { children: ReactNode }) {
   const webcam = useWebcam();
