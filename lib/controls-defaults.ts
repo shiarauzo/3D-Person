@@ -7,6 +7,10 @@
  *
  * Only shader-only knobs are exposed (no GRID_W — changing grid size
  * requires a geometry rebuild and is out of scope for iter 29).
+ *
+ * V2 — PLAN-V2 issue 11: five synthetic-field knobs added.
+ * Default values exactly match the prior hardcoded GLSL literals so there
+ * is no visual change when the panel is at its reset state.
  */
 
 export interface ControlValues {
@@ -24,6 +28,18 @@ export interface ControlValues {
   deformStrength: number;
   /** Extra accent probability multiplier inside the face region. */
   faceAccentBoost: number;
+
+  // ── V2 Synthetic-field knobs ─────────────────────────────────────────────
+  /** Spatial frequency of the value noise lattice (smaller = bigger blobs). */
+  noiseScale: number;
+  /** uTime drift speed multiplier for the value noise. */
+  noiseDrift: number;
+  /** Weight of the vertical gradient in the noise/gradient blend (0=all noise, 1=all gradient). */
+  gradientMix: number;
+  /** Mask-edge hotness boost added to synthLuma at silhouette edges. */
+  edgeBoost: number;
+  /** Lime vs. procedural channel mix, via mix(limeBase, channel, limeMix) (0=full lime, 1=full channel). */
+  limeMix: number;
 }
 
 export const CONTROLS_DEFAULTS: ControlValues = {
@@ -34,4 +50,11 @@ export const CONTROLS_DEFAULTS: ControlValues = {
   limeBias:        0.62,
   deformStrength:  0.07, // fraction of squarePx (same as DEFORM_STRENGTH_FACTOR)
   faceAccentBoost: 3.0,
+
+  // V2 — defaults EXACTLY equal the prior hardcoded GLSL literals.
+  noiseScale:  0.065, // was: cell * 0.065 in valueNoise call
+  noiseDrift:  0.07,  // was: uTime * 0.07 in valueNoise call
+  gradientMix: 0.35,  // was: vGrad * 0.35 in weighted blend (noise share = 1 - 0.35 = 0.65)
+  edgeBoost:   0.35,  // was: edgeFactor * 0.35 in synthLuma clamp
+  limeMix:     0.55,  // was: mix(limeBase, lum*, 0.55) in texColor
 };
