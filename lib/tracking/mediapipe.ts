@@ -164,15 +164,3 @@ export async function createTrackingHandles(): Promise<TrackingHandles> {
   };
 }
 
-// ─── Legacy export (kept for any direct imports that may exist) ───────────────
-
-/**
- * @deprecated Use createTrackingHandles() instead — it shares the FilesetResolver.
- * Kept temporarily for backwards compat; will be removed in a future iteration.
- */
-export async function createHandLandmarker(): Promise<HandLandmarkerHandle> {
-  const handles = await createTrackingHandles();
-  // Close the pose landmarker since caller won't manage it.
-  handles.pose.close();
-  return handles.hand;
-}

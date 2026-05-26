@@ -592,8 +592,7 @@ const fragmentShader = /* glsl */ `
     //   • Active tear bands (tearActive contribution).
     //   • A small global motion influence.
     //
-    // tearActive: 1.0 inside a currently-torn band, 0.0 in calm bands.
-    // This mirrors the tear gate already computed above (uShift != 0).
+    // tearActive: 1.0 when this band is torn (local uShift non-zero), 0.0 otherwise.
     float tearActive = (abs(uShift) > 0.0001) ? 1.0 : 0.0;
 
     float csIntensity = faceFactor * uChannelFaceBias
@@ -927,13 +926,6 @@ const FACE_RADIUS_LERP = 0.08;
  * Lerp speed for easing uFaceActive in/out (0→1 when face appears, 1→0 when lost).
  */
 const FACE_ACTIVE_LERP = 0.10;
-
-/**
- * uFaceAccentBoost: how much extra accent probability is added inside the face region.
- * effAccent inside face = base_effAccent * (1 + faceFactor * uFaceAccentBoost).
- * Default 3.0 → up to 4× more accents at the face core. Capped in shader at 0.95.
- */
-const FACE_ACCENT_BOOST = 3.0;
 
 /**
  * uFaceChaosBias: probability (additional) that a face-region cell picks a
