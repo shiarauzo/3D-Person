@@ -34,7 +34,9 @@ import {
 import { useWebcamContext } from "@/context/webcam-context";
 import { useTracking, type UseTrackingResult } from "@/hooks/use-tracking";
 
-const TrackingContext = createContext<UseTrackingResult | null>(null);
+// Exported so DemoTrackingProvider can share the same context object,
+// letting all consumers (Mosaic, Hud, CameraGate) work identically in demo mode.
+export const TrackingContext = createContext<UseTrackingResult | null>(null);
 
 export function TrackingProvider({ children }: { children: ReactNode }) {
   const { videoRef, status } = useWebcamContext();

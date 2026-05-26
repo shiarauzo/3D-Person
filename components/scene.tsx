@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { Canvas } from "@react-three/fiber";
 import { PerformanceMonitor } from "@react-three/drei";
 import Mosaic from "@/components/mosaic";
@@ -26,10 +26,31 @@ const DPR_CEIL = 2;
  */
 const DPR_STEP = 0.25;
 
+// ---------------------------------------------------------------------------
+// Frame capture helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Download the WebGL canvas as a PNG.
+ * Requires preserveDrawingBuffer=true on the Canvas (set below).
+ * canvas.toDataURL reads pixels from the last committed frame.
+ */
+export function captureFrame(canvas: HTMLCanvasElement): void {
+  const dataUrl = canvas.toDataURL("image/png");
+  const a = document.createElement("a");
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  a.download = `glitch-portrait-${ts}.png`;
+  a.href = dataUrl;
+  a.click();
+}
+
 export default function Scene() {
   // Adaptive DPR state — lives outside Canvas so it can be passed as a prop.
   // Initialised at 1 (safe mid-range; the Canvas will clamp to [DPR_FLOOR, DPR_CEIL]).
   const [dpr, setDpr] = useState(1);
+
+  // Ref to the underlying WebGL canvas element — set via onCreated callback.
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // onDecline: fps consistently below the lower bound → step down.
   // Clamped to DPR_FLOOR so we never go below 0.75.
@@ -43,11 +64,32 @@ export default function Scene() {
     setDpr((prev) => Math.min(DPR_CEIL, +(prev + DPR_STEP).toFixed(2)));
   }, []);
 
+  // Global "P" key capture handler.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "p" || e.key === "P") {
+        const canvas = canvasRef.current;
+        if (canvas) captureFrame(canvas);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   return (
     <Canvas
       orthographic
       dpr={dpr}
       camera={{ zoom: 1, position: [0, 0, 5], near: 0.1, far: 100 }}
+      // preserveDrawingBuffer: required for toDataURL() to read pixels after
+      // the frame has been composited. Has a minor perf cost (~1-2%) on some
+      // drivers; acceptable for a single-canvas creative app.
+      gl={{ preserveDrawingBuffer: true }}
+      onCreated={({ gl }) => {
+        canvasRef.current = gl.domElement;
+      }}
     >
       {/*
        * Iter 26 — PerformanceMonitor (drei) provides automatic fps hysteresis.
