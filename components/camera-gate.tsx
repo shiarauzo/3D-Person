@@ -6,9 +6,10 @@ import HandDebugOverlay from "@/components/hand-debug-overlay";
 
 /**
  * Toggle to show the hand-landmark debug dots over the video.
- * Flip to false (or remove the overlay entirely) once iter 16 is validated.
+ * Kept as a capability but off by default so the final render shows only
+ * the glitch mosaic — no debug dots or bbox overlays.
  */
-const DEBUG_HANDS = true;
+const DEBUG_HANDS = false;
 
 export default function CameraGate() {
   const { videoRef, status, error, start } = useWebcamContext();

@@ -29,9 +29,9 @@ export interface ControlValues {
 export const CONTROLS_DEFAULTS: ControlValues = {
   voidThreshold:   0.20,
   tearProbability: 0.25,
-  tearAmount:      0.035,
+  tearAmount:      0.040,
   accentAmount:    0.12,
-  limeBias:        0.5,
+  limeBias:        0.62,
   deformStrength:  0.07, // fraction of squarePx (same as DEFORM_STRENGTH_FACTOR)
   faceAccentBoost: 3.0,
 };
