@@ -1,6 +1,7 @@
 "use client";
 
 import { Canvas } from "@react-three/fiber";
+import Mosaic from "@/components/mosaic";
 
 export default function Scene() {
   return (
@@ -11,7 +12,7 @@ export default function Scene() {
     >
       <color attach="background" args={["#0a0f0a"]} />
 
-      {/* TODO iter 4-5: mount <Mosaic /> here */}
+      <Mosaic />
     </Canvas>
   );
 }
