@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import * as THREE from "three";
 import type { TrackingHandles } from "@/lib/tracking/mediapipe";
 import type { HandLandmarkerResult, PoseLandmarkerResult } from "@mediapipe/tasks-vision";
 
@@ -96,10 +97,49 @@ export interface UseTrackingResult {
    * See FaceBbox for coordinate details.
    */
   faceBboxRef: React.RefObject<FaceBbox>;
+  /**
+   * Iter 18 — THREE.DataTexture holding the latest selfie segmentation mask.
+   *
+   * Format: THREE.RedFormat, THREE.FloatType — single channel [0, 1] per pixel
+   * where 1.0 = person, 0.0 = background.
+   *
+   * Resolution: MASK_SIZE × MASK_SIZE (256×256) — small enough to upload every
+   * frame cheaply; the mosaic shader bilinearly samples it at each cell UV.
+   *
+   * ── Coordinate alignment note ──────────────────────────────────────────────
+   *   The segmentation mask is produced in RAW (unmirrored) video space —
+   *   exactly the same coordinate system as the aUv values stored on each
+   *   mosaic point. The mosaic's aUv already encodes the mirror + crop + zoom
+   *   transform (see UV crop math in mosaic.tsx). Sampling the mask texture at
+   *   vUv (the per-cell aUv) therefore gives the correct mask value for each
+   *   cell WITHOUT any additional transform — mask and video are automatically
+   *   aligned because they share the same UV.
+   *
+   *   Concretely: the geometry builder computes
+   *     u = uMaxZ - normCol * uSliceZ   ← mirrored
+   *     v = vMinZ + (1 - normRow) * vSliceZ
+   *   and passes this as aUv → vUv. Sampling uMask at vUv samples the mask at
+   *   the mirrored+cropped video position for that cell. The mask pixel at that
+   *   position was produced from the same video frame (same U/V in raw space),
+   *   so they match perfectly.
+   * ──────────────────────────────────────────────────────────────────────────
+   *
+   * Null until the segmenter is initialised and has produced its first result.
+   * Mosaic should guard with uMaskActive=0 while null.
+   */
+  maskTextureRef: React.RefObject<THREE.DataTexture | null>;
 }
 
 /** How often to sync `handCount` state (ms). Avoids per-frame re-renders. */
 const HAND_COUNT_THROTTLE_MS = 1000;
+
+/**
+ * Iter 18 — Segmentation mask texture resolution.
+ * 256×256 is small enough to upload cheaply every frame while giving the
+ * mosaic shader a smooth, bilinearly-sampled person silhouette.
+ * The GPU bilinear filter handles the upscale to screen resolution.
+ */
+const MASK_SIZE = 256;
 
 /**
  * Pose landmark indices used for face bbox computation.
@@ -177,6 +217,14 @@ function computeFaceBbox(poseResult: PoseLandmarkerResult | null): FaceBbox {
  *   - Both detectors run in the SAME rAF loop with the same `now` timestamp.
  *   - poseRef + faceBboxRef exposed for downstream consumers.
  *   - Both landmarkers closed on teardown.
+ *
+ * Iteration 18 additions:
+ *   - ImageSegmenter (selfie_segmenter) initialised alongside the other two.
+ *   - segmentForVideo called each rAF frame via callback API.
+ *   - Confidence mask Float32 data uploaded into a THREE.DataTexture (RedFormat,
+ *     FloatType) which is updated in-place each frame (needsUpdate = true).
+ *   - maskTextureRef exposed; mosaic guards with uMaskActive before mask is ready.
+ *   - ImageSegmenter closed on teardown.
  */
 export function useTracking({
   videoRef,
@@ -186,6 +234,7 @@ export function useTracking({
   const landmarksRef = useRef<HandLandmarkerResult | null>(null);
   const poseRef = useRef<PoseLandmarkerResult | null>(null);
   const faceBboxRef = useRef<FaceBbox>({ centerX: 0.5, centerY: 0.3, radius: 0.15, active: false });
+  const maskTextureRef = useRef<THREE.DataTexture | null>(null);
   const [handCount, setHandCount] = useState(0);
 
   useEffect(() => {
@@ -282,6 +331,91 @@ export function useTracking({
                 }
               }
 
+              // ── Iter 18: Segmentation ────────────────────────────────────
+              // segmentForVideo uses a result callback (not a return value).
+              // The callback receives the ImageSegmenterResult synchronously
+              // before the next animation frame in Chrome/Firefox.
+              //
+              // ── Mask upload strategy ─────────────────────────────────────
+              // We use THREE.DataTexture (RedFormat, FloatType, MASK_SIZE²) and
+              // update it in-place each frame. Compared to a CanvasTexture:
+              //   + No canvas 2D context allocation.
+              //   + Direct Float32Array → GPU upload; no per-frame RGBA encode.
+              //   + LinearFilter bilinear upscaling is free on the GPU.
+              //   - Requires explicit needsUpdate = true each frame (done below).
+              //
+              // ── Coordinate note ──────────────────────────────────────────
+              // The MediaPipe mask is in RAW (unmirrored) video space.
+              // aUv values on each mosaic point already encode the mirrored +
+              // cropped + zoomed UV (see mosaic.tsx UV crop math). Sampling
+              // uMask at vUv (= aUv) thus reads the correct raw-space pixel for
+              // each cell — no additional transform is needed in the shader.
+              try {
+                handles.segmenter.segmenter.segmentForVideo(
+                  video,
+                  now,
+                  (segResult) => {
+                    const masks = segResult.confidenceMasks;
+                    if (!masks || masks.length === 0) return;
+
+                    // confidenceMasks[0] = person probability channel.
+                    // getAsFloat32Array() returns a flat Float32 array of
+                    // width×height values in row-major order (origin top-left,
+                    // same as the raw video frame).
+                    const rawMask = masks[0].getAsFloat32Array();
+                    const srcW = masks[0].width;
+                    const srcH = masks[0].height;
+
+                    // Allocate or reuse the DataTexture.
+                    if (!maskTextureRef.current) {
+                      // Allocate MASK_SIZE² float buffer. Initial fill = 0.0
+                      // (all background) so the mosaic sees a safe value before
+                      // the first real result arrives.
+                      const buf = new Float32Array(MASK_SIZE * MASK_SIZE);
+                      const tex = new THREE.DataTexture(
+                        buf,
+                        MASK_SIZE,
+                        MASK_SIZE,
+                        THREE.RedFormat,
+                        THREE.FloatType,
+                      );
+                      tex.minFilter = THREE.LinearFilter;
+                      tex.magFilter = THREE.LinearFilter;
+                      tex.generateMipmaps = false;
+                      // DataTexture defaults to flipY=false, but the VideoTexture
+                      // (sampled at the same vUv) defaults to flipY=true. Without
+                      // this, the mask reads upside-down vs the video and gates the
+                      // wrong cells. Match the video so mask + feed align in V.
+                      tex.flipY = true;
+                      maskTextureRef.current = tex;
+                    }
+
+                    const tex = maskTextureRef.current;
+                    // tex.image.data is typed as Uint8Array|Uint8ClampedArray in
+                    // Three.js @types, but we constructed the DataTexture with
+                    // FloatType so the underlying buffer is actually Float32Array.
+                    // The double cast through unknown is the correct TS escape hatch.
+                    const dst = tex.image.data as unknown as Float32Array;
+
+                    // Downsample / resample the raw mask into MASK_SIZE×MASK_SIZE
+                    // using nearest-neighbor (sufficient for a coarse segmentation
+                    // mask; bilinear filtering on the GPU handles the visual result).
+                    for (let row = 0; row < MASK_SIZE; row++) {
+                      for (let col = 0; col < MASK_SIZE; col++) {
+                        const srcCol = Math.floor((col / MASK_SIZE) * srcW);
+                        const srcRow = Math.floor((row / MASK_SIZE) * srcH);
+                        dst[row * MASK_SIZE + col] = rawMask[srcRow * srcW + srcCol];
+                      }
+                    }
+
+                    tex.needsUpdate = true;
+                  },
+                );
+              } catch (err) {
+                // Log only once to avoid flooding the console.
+                console.error("[tracking] segmentForVideo error:", err);
+              }
+
               lastDetectedTime = now;
             }
           }
@@ -305,15 +439,21 @@ export function useTracking({
       if (handlesRef.current) {
         handlesRef.current.hand.close();
         handlesRef.current.pose.close();
+        handlesRef.current.segmenter.close();
         handlesRef.current = null;
-        console.log("[tracking] hand + pose landmarkers closed");
+        console.log("[tracking] hand + pose + segmenter closed");
       }
       landmarksRef.current = null;
       poseRef.current = null;
       faceBboxRef.current = { centerX: 0.5, centerY: 0.3, radius: 0.15, active: false };
+      // Dispose the DataTexture so the GPU memory is freed.
+      if (maskTextureRef.current) {
+        maskTextureRef.current.dispose();
+        maskTextureRef.current = null;
+      }
       setHandCount(0);
     };
   }, [enabled, videoRef]);
 
-  return { landmarksRef, handCount, poseRef, faceBboxRef };
+  return { landmarksRef, handCount, poseRef, faceBboxRef, maskTextureRef };
 }

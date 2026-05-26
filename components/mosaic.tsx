@@ -7,6 +7,18 @@ import { useWebcamContext } from "@/context/webcam-context";
 import { useTrackingContext } from "@/context/tracking-context";
 import { paletteAsVector3, PALETTE_SIZE } from "@/lib/palette";
 
+// ---------------------------------------------------------------------------
+// Iter 18 — Mask sampling threshold
+// ---------------------------------------------------------------------------
+/**
+ * Person-probability threshold for the segmentation mask.
+ * Cells with mask value < MASK_THRESHOLD are treated as off-person → void.
+ * 0.5 is the natural midpoint of the [0,1] confidence range; lower values
+ * keep more borderline pixels as person (softer silhouette edge), higher
+ * values trim more aggressively (crisper but slightly smaller silhouette).
+ */
+const MASK_THRESHOLD = 0.5;
+
 /**
  * Iteration 7 — Grid density + framing tune.
  *
@@ -148,6 +160,28 @@ const fragmentShader = /* glsl */ `
   uniform sampler2D uVideo;
   uniform vec3  uVoidColor;       // near-black void (#0a0f0a)  iter 8
   uniform float uVoidThreshold;   // base luma threshold; below this → snap to void  iter 8/12
+
+  // Iter 18 — Segmentation mask uniforms.
+  //
+  // uMask: RED/FLOAT DataTexture, 256×256. Each texel = person probability [0,1].
+  //   Produced by MediaPipe selfie_segmenter in RAW (unmirrored) video space.
+  //
+  // uMaskActive: 0.0 = mask not ready yet (skip masking, behave as before);
+  //              1.0 = mask is valid, gate off-person cells to void.
+  //
+  // uMaskThreshold: probability below which a cell is treated as off-person.
+  //   Default 0.5 — natural midpoint of [0,1] confidence output.
+  //
+  // ── Coordinate alignment ─────────────────────────────────────────────────
+  //   vUv (= aUv) already encodes the mirrored + cropped + zoomed UV for each
+  //   mosaic cell (see UV crop math in mosaic.tsx). The mask was produced in
+  //   RAW video space, which is the same space aUv is built from before the
+  //   mirror/crop transform.  Sampling uMask at vUv thus reads the correct
+  //   raw-space mask pixel — mask and video texture are automatically aligned
+  //   because they share the same UV coordinates. No extra transform needed.
+  uniform sampler2D uMask;
+  uniform float     uMaskActive;
+  uniform float     uMaskThreshold;
   // Iter 13 — Accent scatter.
   // uAccentAmount: probability [0,1] that a non-void cell is overridden with a
   // random accent swatch (palette indices 3..7: magenta, cyan, blue, red, amber).
@@ -269,6 +303,27 @@ const fragmentShader = /* glsl */ `
     // sRGB; we output it directly. The renderer output colorspace is also sRGB,
     // so there is no double-encode.
     vec4 texColor = texture2D(uVideo, vUv);
+
+    // Iter 18 — Segmentation mask gate (runs before luma void check).
+    //
+    // Sample the 256×256 person-probability mask at the same UV as the video
+    // texture. vUv encodes the mirrored+cropped+zoomed UV, so it reads the
+    // correct mask texel for this cell (see coordinate alignment note above).
+    //
+    // When uMaskActive == 0.0 (mask not ready), skip masking entirely so the
+    // mosaic renders as it did before iter 18 — no visual regression on load.
+    //
+    // When the mask says this cell is background (prob < uMaskThreshold),
+    // output void black immediately without entering the luma/palette path.
+    // This produces the clean bust silhouette: only person-covered cells get
+    // their neon color; off-person cells collapse to the void background.
+    if (uMaskActive > 0.5) {
+      float maskProb = texture2D(uMask, vUv).r;
+      if (maskProb < uMaskThreshold) {
+        gl_FragColor = vec4(uVoidColor, 1.0);
+        return;
+      }
+    }
 
     // Iter 8 — Void floor: collapse very dark cells to the exact void color so
     // background noise merges seamlessly with the scene background (#0a0f0a).
@@ -396,7 +451,8 @@ export default function Mosaic() {
   const { videoRef, status } = useWebcamContext();
 
   // Iter 16: read the shared landmarks ref (single detect loop, no duplicate).
-  const { landmarksRef } = useTrackingContext();
+  // Iter 18: read maskTextureRef for the selfie segmentation mask.
+  const { landmarksRef, maskTextureRef } = useTrackingContext();
 
   const { size, gl } = useThree();
 
@@ -579,6 +635,14 @@ export default function Mosaic() {
       uHandActive1:    { value: 0.0 },
       uDeformRadius:   { value: squarePx * DEFORM_RADIUS_FACTOR },
       uDeformStrength: { value: squarePx * DEFORM_STRENGTH_FACTOR },
+      // Iter 18 — Segmentation mask uniforms.
+      // uMask: updated each frame in useFrame once maskTextureRef.current is set.
+      // uMaskActive: 0.0 until the first mask texture is produced; then 1.0.
+      //   Prevents shader from sampling an uninitialised texture.
+      // uMaskThreshold: probability below which a cell is gated to void.
+      uMask:           { value: null },
+      uMaskActive:     { value: 0.0 },
+      uMaskThreshold:  { value: MASK_THRESHOLD },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
@@ -685,6 +749,16 @@ export default function Mosaic() {
   useFrame(() => {
     // Keep VideoTexture up-to-date.
     if (texture) texture.needsUpdate = true;
+
+    // ── Iter 18: segmentation mask uniform update ────────────────────────────
+    // The DataTexture is allocated and updated (needsUpdate=true) in the rAF
+    // callback inside use-tracking.ts. Here we only need to wire the texture
+    // reference into the shader uniform and flip uMaskActive once it's ready.
+    const maskTex = maskTextureRef.current;
+    if (maskTex) {
+      uniforms.uMask.value = maskTex;
+      uniforms.uMaskActive.value = 1.0;
+    }
 
     // ── Iter 16: hand-deform uniform update ─────────────────────────────────
     const result = landmarksRef.current;
