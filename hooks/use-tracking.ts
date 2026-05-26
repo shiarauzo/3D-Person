@@ -1,14 +1,44 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { HandLandmarkerHandle } from "@/lib/tracking/mediapipe";
-import type { HandLandmarkerResult } from "@mediapipe/tasks-vision";
+import type { TrackingHandles } from "@/lib/tracking/mediapipe";
+import type { HandLandmarkerResult, PoseLandmarkerResult } from "@mediapipe/tasks-vision";
 
 interface UseTrackingOptions {
   /** The video element to track against. Must be playing for init to proceed. */
   videoRef: React.RefObject<HTMLVideoElement | null>;
   /** Set to false to skip init / trigger teardown. */
   enabled: boolean;
+}
+
+/**
+ * Normalized face bounding box derived from pose landmarks (RAW MediaPipe space).
+ *
+ * ── Coordinate note ─────────────────────────────────────────────────────────
+ *   All values are in the RAW (unmirrored) video coordinate space, normalized
+ *   [0,1] with origin top-left — exactly as MediaPipe emits them.
+ *
+ *   Consumers MUST apply the same mirror + crop transform that the mosaic uses
+ *   before mapping to screen/shader coordinates:
+ *     x_screen = 1 - centerX           (selfie mirror)
+ *     then apply UV_ZOOM crop           (see use-tracking coordinate notes)
+ *
+ *   `active` is false when no pose is detected this frame.
+ * ────────────────────────────────────────────────────────────────────────────
+ */
+export interface FaceBbox {
+  /** Horizontal center of face region, normalized [0,1], RAW space. */
+  centerX: number;
+  /** Vertical center of face region, normalized [0,1], RAW space. */
+  centerY: number;
+  /**
+   * Radius of the bounding circle that encloses the face landmark cluster,
+   * expressed as a fraction of video height.  Use as a rough scale for the
+   * face region size.
+   */
+  radius: number;
+  /** True when a pose was detected this frame and the bbox is valid. */
+  active: boolean;
 }
 
 export interface UseTrackingResult {
@@ -53,23 +83,109 @@ export interface UseTrackingResult {
   landmarksRef: React.RefObject<HandLandmarkerResult | null>;
   /** Reactive hand count (0, 1, or 2). Updated at most once per second. */
   handCount: number;
+  /**
+   * Ref holding the latest PoseLandmarkerResult (populated every rAF frame).
+   * 33 normalized landmarks per detected pose. RAW (unmirrored) space.
+   * Null when no pose is detected or pose landmarker is not yet ready.
+   */
+  poseRef: React.RefObject<PoseLandmarkerResult | null>;
+  /**
+   * Ref holding the computed face bounding box for the current frame.
+   * Derived from nose (0), eye/ear landmarks (1-8), and shoulders (11,12).
+   * RAW MediaPipe space — consumers must apply mirror + crop transforms.
+   * See FaceBbox for coordinate details.
+   */
+  faceBboxRef: React.RefObject<FaceBbox>;
 }
 
 /** How often to sync `handCount` state (ms). Avoids per-frame re-renders. */
 const HAND_COUNT_THROTTLE_MS = 1000;
 
 /**
- * Owns the HandLandmarker lifecycle: init → rAF detect loop → teardown.
+ * Pose landmark indices used for face bbox computation.
  *
- * Iteration 15: runs detectForVideo every animation frame, writes results to
- * a ref (zero re-render cost), and exposes a throttled handCount for HUD use.
+ * MediaPipe BlazePose 33-point topology:
+ *   0  = nose
+ *   1  = left eye (inner)
+ *   2  = left eye
+ *   3  = left eye (outer)
+ *   4  = right eye (inner)
+ *   5  = right eye
+ *   6  = right eye (outer)
+ *   7  = left ear
+ *   8  = right ear
+ *   11 = left shoulder  (anchors the lower face region)
+ *   12 = right shoulder
+ *
+ * Shoulders are included to give the bbox enough vertical extent to capture
+ * the head + neck region, which is useful for the face-density pass (iter 23).
+ */
+const FACE_LANDMARK_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12] as const;
+
+/**
+ * Derive a face bounding circle from a subset of pose landmarks.
+ * Returns an inactive bbox when no pose or insufficient landmarks are present.
+ */
+function computeFaceBbox(poseResult: PoseLandmarkerResult | null): FaceBbox {
+  const inactive: FaceBbox = { centerX: 0.5, centerY: 0.3, radius: 0.15, active: false };
+
+  if (!poseResult || poseResult.landmarks.length === 0) return inactive;
+
+  const pose = poseResult.landmarks[0];
+  if (!pose || pose.length < 13) return inactive;
+
+  // Collect the face/shoulder landmark positions.
+  const pts: Array<{ x: number; y: number }> = [];
+  for (const idx of FACE_LANDMARK_INDICES) {
+    const lm = pose[idx];
+    if (lm) pts.push({ x: lm.x, y: lm.y });
+  }
+  if (pts.length === 0) return inactive;
+
+  // Centroid.
+  let sumX = 0;
+  let sumY = 0;
+  for (const p of pts) {
+    sumX += p.x;
+    sumY += p.y;
+  }
+  const centerX = sumX / pts.length;
+  const centerY = sumY / pts.length;
+
+  // Radius = max distance from centroid to any included landmark.
+  let radius = 0;
+  for (const p of pts) {
+    const dx = p.x - centerX;
+    const dy = p.y - centerY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > radius) radius = dist;
+  }
+
+  // Clamp radius to a sensible minimum (avoids 0 when the person is perfectly
+  // centred with all landmarks coincident — extremely unlikely but defensive).
+  radius = Math.max(radius, 0.05);
+
+  return { centerX, centerY, radius, active: true };
+}
+
+/**
+ * Owns the HandLandmarker + PoseLandmarker lifecycle:
+ *   init → single rAF detect loop (both detectors, strictly increasing timestamps) → teardown.
+ *
+ * Iteration 17 additions:
+ *   - PoseLandmarker initialised from the same FilesetResolver (one fetch).
+ *   - Both detectors run in the SAME rAF loop with the same `now` timestamp.
+ *   - poseRef + faceBboxRef exposed for downstream consumers.
+ *   - Both landmarkers closed on teardown.
  */
 export function useTracking({
   videoRef,
   enabled,
 }: UseTrackingOptions): UseTrackingResult {
-  const handleRef = useRef<HandLandmarkerHandle | null>(null);
+  const handlesRef = useRef<TrackingHandles | null>(null);
   const landmarksRef = useRef<HandLandmarkerResult | null>(null);
+  const poseRef = useRef<PoseLandmarkerResult | null>(null);
+  const faceBboxRef = useRef<FaceBbox>({ centerX: 0.5, centerY: 0.3, radius: 0.15, active: false });
   const [handCount, setHandCount] = useState(0);
 
   useEffect(() => {
@@ -85,7 +201,8 @@ export function useTracking({
     // Throttle hand-count state updates to avoid flooding React with renders.
     let lastHandCountUpdate = 0;
     // Log detect errors at most once so the console isn't spammed each frame.
-    let errorLogged = false;
+    let handErrorLogged = false;
+    let poseErrorLogged = false;
 
     async function init() {
       const video = videoRef.current;
@@ -96,64 +213,76 @@ export function useTracking({
       }
 
       try {
-        // Lazy import — createHandLandmarker itself does the dynamic import of
+        // Lazy import — createTrackingHandles does the dynamic import of
         // @mediapipe/tasks-vision, so nothing from that package runs server-side.
-        const { createHandLandmarker } = await import(
+        // The FilesetResolver is created ONCE inside createTrackingHandles and
+        // shared between HandLandmarker and PoseLandmarker — no duplicate fetch.
+        const { createTrackingHandles } = await import(
           "@/lib/tracking/mediapipe"
         );
 
         if (cancelled) return; // unmounted while awaiting
 
-        const handle = await createHandLandmarker();
+        const handles = await createTrackingHandles();
 
         if (cancelled) {
-          // Unmounted while the model was loading — clean up immediately.
-          handle.close();
+          // Unmounted while models were loading — clean up immediately.
+          handles.hand.close();
+          handles.pose.close();
           return;
         }
 
-        handleRef.current = handle;
-        console.log("[tracking] hand landmarker ready — starting detect loop");
+        handlesRef.current = handles;
+        console.log("[tracking] hand + pose landmarkers ready — starting detect loop");
 
         // ── rAF detect loop ────────────────────────────────────────────────
+        // Both detectors share the SAME `now` timestamp per frame, satisfying
+        // MediaPipe's requirement that timestamps strictly increase per call.
         function detectFrame() {
           if (cancelled) return;
 
           const video = videoRef.current;
-          const landmarker = handleRef.current?.landmarker;
+          const handles = handlesRef.current;
 
-          if (video && landmarker && video.readyState >= 2 && !video.paused) {
-            // Use performance.now() as the timestamp; it strictly increases and
-            // is what MediaPipe VIDEO mode expects (milliseconds since page load).
-            // We compare against the video's currentTime (seconds) to skip frames
-            // where the video decoder hasn't produced a new image yet.
+          if (video && handles && video.readyState >= 2 && !video.paused) {
             const now = performance.now();
 
-            // currentTime is in seconds; convert to ms for a coarser guard.
-            // Only run detect when video has advanced to a new frame.
-            // We track lastDetectedTime in ms (performance.now units) and
-            // additionally guard by checking the video's currentTime changed —
-            // if the video frame truly hasn't changed there's no point calling
-            // detect (MediaPipe would throw on a non-increasing timestamp).
             if (now > lastDetectedTime) {
+              // ── Hand detect ─────────────────────────────────────────────
               try {
-                const result = landmarker.detectForVideo(video, now);
-                landmarksRef.current = result;
-                lastDetectedTime = now;
+                const handResult = handles.hand.landmarker.detectForVideo(video, now);
+                landmarksRef.current = handResult;
 
                 // Throttle reactive hand count updates.
-                const count = result.landmarks.length;
+                const count = handResult.landmarks.length;
                 const elapsed = now - lastHandCountUpdate;
                 if (elapsed >= HAND_COUNT_THROTTLE_MS) {
                   setHandCount(count);
                   lastHandCountUpdate = now;
                 }
               } catch (err) {
-                if (!errorLogged) {
-                  console.error("[tracking] detectForVideo error:", err);
-                  errorLogged = true;
+                if (!handErrorLogged) {
+                  console.error("[tracking] hand detectForVideo error:", err);
+                  handErrorLogged = true;
                 }
               }
+
+              // ── Pose detect ─────────────────────────────────────────────
+              // Uses the SAME `now` — both calls get an identical strictly-
+              // increasing timestamp; MediaPipe accepts this because they are
+              // separate detector instances (each tracks its own last-ts state).
+              try {
+                const poseResult = handles.pose.landmarker.detectForVideo(video, now);
+                poseRef.current = poseResult;
+                faceBboxRef.current = computeFaceBbox(poseResult);
+              } catch (err) {
+                if (!poseErrorLogged) {
+                  console.error("[tracking] pose detectForVideo error:", err);
+                  poseErrorLogged = true;
+                }
+              }
+
+              lastDetectedTime = now;
             }
           }
 
@@ -173,15 +302,18 @@ export function useTracking({
     return () => {
       cancelled = true;
       cancelAnimationFrame(rafId);
-      if (handleRef.current) {
-        handleRef.current.close();
-        handleRef.current = null;
-        console.log("[tracking] hand landmarker closed");
+      if (handlesRef.current) {
+        handlesRef.current.hand.close();
+        handlesRef.current.pose.close();
+        handlesRef.current = null;
+        console.log("[tracking] hand + pose landmarkers closed");
       }
       landmarksRef.current = null;
+      poseRef.current = null;
+      faceBboxRef.current = { centerX: 0.5, centerY: 0.3, radius: 0.15, active: false };
       setHandCount(0);
     };
   }, [enabled, videoRef]);
 
-  return { landmarksRef, handCount };
+  return { landmarksRef, handCount, poseRef, faceBboxRef };
 }

@@ -1,11 +1,14 @@
 "use client";
 
 /**
- * TrackingContext — iter 16
+ * TrackingContext — iter 17
  *
  * Lifts the single useTracking instance above both CameraGate (debug overlay)
  * and Mosaic (hand-deform uniforms), guaranteeing exactly ONE detectForVideo
  * loop regardless of how many consumers read the landmarks ref.
+ *
+ * Iter 17 adds: poseRef + faceBboxRef from the PoseLandmarker (data only,
+ * no shader wiring yet — that's iter 23).
  *
  * Hierarchy:
  *   <WebcamProvider>           ← owns videoRef + camera lifecycle
@@ -32,6 +35,7 @@ export function TrackingProvider({ children }: { children: ReactNode }) {
   const { videoRef, status } = useWebcamContext();
 
   // Single tracking loop for the whole app.
+  // Returns hand landmarks, pose landmarks, and derived face bbox.
   const tracking = useTracking({
     videoRef,
     enabled: status === "ready",
