@@ -90,10 +90,23 @@ const vertexShader = /* glsl */ `
   uniform float uDeformRadius;
   uniform float uDeformStrength;
 
+  // Iter 20 — Motion-reactive intensity.
+  // uMotion: normalized motion signal [0, 1] derived from hand velocity.
+  // uMotionDeformBoost: multiplier headroom for deform strength at peak motion.
+  //   effectiveStrength = uDeformStrength * (1 + uMotion * uMotionDeformBoost)
+  //   At motion=0: effectiveStrength == uDeformStrength (iter-19 baseline).
+  //   At motion=1: effectiveStrength == uDeformStrength * (1 + boost).
+  uniform float uMotion;
+  uniform float uMotionDeformBoost; // default 0.6 → up to 60% extra warp
+
   varying vec2 vUv;
 
   void main() {
     vUv = aUv;
+
+    // Iter 20 — Scale effective deform strength by motion signal.
+    // At idle (uMotion=0) this is identical to iter-19 behaviour.
+    float effectiveStrength = uDeformStrength * (1.0 + uMotion * uMotionDeformBoost);
 
     // Iter 16 — Compute radial push displacement for each active hand.
     // Uses the XY plane (Z=0 for all vertices), so we work entirely in 2D.
@@ -103,7 +116,7 @@ const vertexShader = /* glsl */ `
     //   dist  = length(delta)
     //   falloff = smoothstep(uDeformRadius, 0.0, dist)
     //             → 1.0 at the hand centre, 0.0 at uDeformRadius and beyond
-    //   disp  = normalize(delta) * uDeformStrength * falloff * active
+    //   disp  = normalize(delta) * effectiveStrength * falloff * active
     //
     // Guard: skip normalize when the vertex is exactly at the hand centre
     //   (delta == vec2(0)) to avoid NaN / division-by-zero.
@@ -120,7 +133,7 @@ const vertexShader = /* glsl */ `
       float dist0 = length(delta0);
       if (dist0 > 0.001) {
         float falloff0 = smoothstep(uDeformRadius, 0.0, dist0);
-        totalDisp += normalize(delta0) * uDeformStrength * falloff0 * uHandActive0;
+        totalDisp += normalize(delta0) * effectiveStrength * falloff0 * uHandActive0;
       }
     }
 
@@ -130,15 +143,15 @@ const vertexShader = /* glsl */ `
       float dist1 = length(delta1);
       if (dist1 > 0.001) {
         float falloff1 = smoothstep(uDeformRadius, 0.0, dist1);
-        totalDisp += normalize(delta1) * uDeformStrength * falloff1 * uHandActive1;
+        totalDisp += normalize(delta1) * effectiveStrength * falloff1 * uHandActive1;
       }
     }
 
-    // Clamp total displacement to 2× strength so two overlapping hands
+    // Clamp total displacement to 2× effectiveStrength so two overlapping hands
     // can't push a cell more than twice the intended maximum.
     float dispLen = length(totalDisp);
-    if (dispLen > uDeformStrength * 2.0) {
-      totalDisp = totalDisp / dispLen * uDeformStrength * 2.0;
+    if (dispLen > effectiveStrength * 2.0) {
+      totalDisp = totalDisp / dispLen * effectiveStrength * 2.0;
     }
 
     pos.xy += totalDisp;
@@ -203,10 +216,21 @@ const fragmentShader = /* glsl */ `
   uniform float     uMaskActive;
   uniform float     uMaskThreshold;
   uniform float     uMaskGamma;
+  // Iter 20 — Motion-reactive intensity.
+  // uMotion: normalized [0,1] motion signal (derived from hand velocity in JS).
+  //   0.0 = idle/still → iter-19 baseline look.
+  //   1.0 = fast movement → boosted accent scatter + stronger deform (vertex).
+  // uMotionAccentBoost: multiplier headroom for accent probability at peak motion.
+  //   effAccentAmount = uAccentAmount * (1 + uMotion * uMotionAccentBoost)
+  //   Default 1.5 → up to 2.5× more accents at full motion. Capped at 0.95.
+  uniform float uMotion;
+  uniform float uMotionAccentBoost; // default 1.5
+
   // Iter 13 — Accent scatter.
-  // uAccentAmount: probability [0,1] that a non-void cell is overridden with a
-  // random accent swatch (palette indices 3..7: magenta, cyan, blue, red, amber).
-  // Default ~0.12 keeps accents a clear minority (~12 % of body cells).
+  // uAccentAmount: base probability [0,1] that a non-void cell is overridden with
+  // a random accent swatch (palette indices 3..7: magenta, cyan, blue, red, amber).
+  // Default ~0.12 keeps accents a clear minority (~12 % of body cells) at idle.
+  // Iter 20: effective amount is boosted by uMotion × uMotionAccentBoost.
   uniform float uAccentAmount;
   // The five accent colors (raw sRGB, matching lib/palette.ts indices 3..7).
   // A separate array avoids re-indexing the main uPalette[] in the hot path.
@@ -428,14 +452,21 @@ const fragmentShader = /* glsl */ `
     // Strategy: derive a stable per-cell coordinate from vUv, then draw two hashes
     // — one to decide IF this cell gets an accent, one to pick WHICH accent color.
     // Void cells (luma < effectiveThreshold) are left untouched.
+    //
+    // Iter 20 — Motion boost: effective accent probability is amplified by the
+    // motion signal. effAccentAmount = uAccentAmount * (1 + uMotion * boost).
+    // Clamped to 0.95 so the figure can never become a solid blob of accents.
     if (luma >= effectiveThreshold) {
       // Cell grid coordinate — integer pair, one per mosaic square.
       // float(GRID_W/GRID_H) must be a literal constant for GLSL ES.
       vec2 cell = floor(vUv * 64.0);
 
+      // Iter 20: motion-boosted accent probability. Clamp hard at 0.95.
+      float effAccentAmount = min(uAccentAmount * (1.0 + uMotion * uMotionAccentBoost), 0.95);
+
       // First hash: scatter probability gate.
       float h1 = cellHash(cell);
-      if (h1 < uAccentAmount) {
+      if (h1 < effAccentAmount) {
         // Second hash (offset seed so it's independent of h1): pick accent index.
         float h2 = cellHash(cell + vec2(57.0, 31.0));
         // Map h2 uniformly onto [0, ACCENT_COUNT-1].
@@ -510,6 +541,46 @@ const HAND_LERP_SPEED = 0.25;
  * Lower = softer fade; higher = snappier.
  */
 const ACTIVE_LERP_SPEED = 0.15;
+
+// ---------------------------------------------------------------------------
+// Iter 20 — Motion-reactive intensity constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalisation divisor for hand speed → motion signal.
+ *
+ * Raw speed = sum of per-frame pixel displacement of each active hand's
+ * smoothed world-space position.  We divide by MOTION_SPEED_MAX so that
+ * "fast arm movement" ≈ 1.0, "slow drift" ≈ 0.1–0.3, "idle" ≈ 0.0.
+ *
+ * At 60 fps and squarePx ≈ 600 px, a hand moving across the whole frame in
+ * ~0.5 s moves ~1200 px/s = ~20 px/frame.  LERP attenuates this by ~0.25,
+ * so the smoothed position moves ~5 px/frame.  Two hands sum to ~10 px/frame.
+ * MOTION_SPEED_MAX = 12.0 px → peak motion ≈ 0.8–1.0 under fast movement.
+ */
+const MOTION_SPEED_MAX = 12.0;
+
+/**
+ * Per-frame decay factor applied to uMotion when instantaneous speed drops.
+ * 0.92 at 60 fps decays to ~0.1 in ~1.5 s — fast enough to feel responsive,
+ * slow enough to avoid flickering when the hands momentarily pause.
+ */
+const MOTION_DECAY = 0.92;
+
+/**
+ * Maximum accent-scatter boost multiplier (sent to GLSL as uMotionAccentBoost).
+ * effAccent = uAccentAmount * (1 + uMotion * 1.5)
+ * At full motion: 0.12 * 2.5 = 0.30 (30 % of body cells accent).
+ * Clamped in shader to 0.95 as an absolute ceiling.
+ */
+const MOTION_ACCENT_BOOST = 1.5;
+
+/**
+ * Maximum deform-strength boost multiplier (sent to GLSL as uMotionDeformBoost).
+ * effectiveStrength = uDeformStrength * (1 + uMotion * 0.6)
+ * At full motion: strength × 1.6 — noticeably more warp without flying off-grid.
+ */
+const MOTION_DEFORM_BOOST = 0.6;
 
 // ---------------------------------------------------------------------------
 // Component
@@ -717,6 +788,18 @@ export default function Mosaic() {
       uMaskActive:     { value: 0.0 },
       uMaskThreshold:  { value: MASK_THRESHOLD },
       uMaskGamma:      { value: MASK_GAMMA },
+      // Iter 20 — Motion-reactive intensity uniforms.
+      // uMotion: smoothed [0,1] motion signal updated every frame in useFrame.
+      //   At idle: 0.0 → visual output identical to iter-19 baseline.
+      //   At peak: 1.0 → max accent boost + max deform boost.
+      //   Updated via direct mutation (no setState, no re-render cost).
+      // uMotionAccentBoost: headroom multiplier for accent probability.
+      //   Matches the JS constant MOTION_ACCENT_BOOST (1.5 default).
+      // uMotionDeformBoost: headroom multiplier for deform strength.
+      //   Matches the JS constant MOTION_DEFORM_BOOST (0.6 default).
+      uMotion:            { value: 0.0 },
+      uMotionAccentBoost: { value: MOTION_ACCENT_BOOST },
+      uMotionDeformBoost: { value: MOTION_DEFORM_BOOST },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
@@ -820,6 +903,15 @@ export default function Mosaic() {
   const smoothedActive0 = useRef(0);
   const smoothedActive1 = useRef(0);
 
+  // Iter 20 — Motion signal state (mutable refs — no re-render cost).
+  // prevSmoothed0/1: previous frame's smoothed hand position, used to compute
+  // per-frame displacement (speed). Updated AFTER the lerp each frame.
+  const prevSmoothed0 = useRef(new THREE.Vector2(0, 0));
+  const prevSmoothed1 = useRef(new THREE.Vector2(0, 0));
+  // motionRef: current smoothed motion signal [0,1].
+  // Updated in-place via decay + instantaneous max strategy.
+  const motionRef = useRef(0);
+
   useFrame(() => {
     // Keep VideoTexture up-to-date.
     if (texture) texture.needsUpdate = true;
@@ -892,11 +984,38 @@ export default function Mosaic() {
       smoothedActive1.current += (0 - smoothedActive1.current) * ACTIVE_LERP_SPEED;
     }
 
+    // ── Iter 20: motion signal update ───────────────────────────────────────
+    // Compute per-frame displacement of each hand's smoothed position relative
+    // to the previous frame. Sum both hands → raw speed in world-px/frame.
+    // Normalise to [0,1] via MOTION_SPEED_MAX, clamp, then apply decay strategy:
+    //   motionRef = max(motionRef * MOTION_DECAY, instantaneous)
+    // This ramps up instantly on movement and decays gracefully when still.
+    // Note: only hands that are currently active (smoothedActive > 0.05) contribute
+    // to speed — prevents ghost displacement from hands fading in/out.
+
+    let rawSpeed = 0;
+
+    if (smoothedActive0.current > 0.05) {
+      rawSpeed += smoothedHand0.current.distanceTo(prevSmoothed0.current);
+    }
+    if (smoothedActive1.current > 0.05) {
+      rawSpeed += smoothedHand1.current.distanceTo(prevSmoothed1.current);
+    }
+
+    // Store current smoothed positions as previous for next frame AFTER reading delta.
+    prevSmoothed0.current.copy(smoothedHand0.current);
+    prevSmoothed1.current.copy(smoothedHand1.current);
+
+    const instantaneous = Math.min(rawSpeed / MOTION_SPEED_MAX, 1.0);
+    // Decay existing motion, then take whichever is larger.
+    motionRef.current = Math.max(motionRef.current * MOTION_DECAY, instantaneous);
+
     // Write to shader uniforms (direct mutation, no re-render cost).
     (uniforms.uHand0.value as THREE.Vector2).copy(smoothedHand0.current);
     (uniforms.uHand1.value as THREE.Vector2).copy(smoothedHand1.current);
     uniforms.uHandActive0.value = smoothedActive0.current;
     uniforms.uHandActive1.value = smoothedActive1.current;
+    uniforms.uMotion.value      = motionRef.current;
   });
 
   if (!texture) return null;
