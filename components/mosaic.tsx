@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useThree, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import { useWebcamContext } from "@/context/webcam-context";
+import { paletteAsVector3, PALETTE_SIZE } from "@/lib/palette";
 
 /**
  * Iteration 7 — Grid density + framing tune.
@@ -60,7 +61,30 @@ const fragmentShader = /* glsl */ `
   uniform vec3  uVoidColor;      // near-black void (#0a0f0a)  iter 8
   uniform float uVoidThreshold;  // luma below this → snap to void  iter 8
 
+  // Iter 9 — Palette LUT (plumbing; not applied yet).
+  // GLSL ES requires a compile-time constant for array size — use #define.
+  #define PALETTE_SIZE 9
+  uniform vec3  uPalette[PALETTE_SIZE]; // raw sRGB vec3 per color
+  uniform int   uPaletteSize;           // always 9 for now
+  uniform float uPaletteMix;            // 0.0 = iter-8 output (default); 1.0 = quantized (iter 10)
+
   varying vec2 vUv;
+
+  // Iter 9 helper: find the nearest palette entry by squared RGB distance.
+  // Called here to prove compilation; result is only blended in when uPaletteMix > 0.
+  vec3 nearestPaletteColor(vec3 color) {
+    vec3 best = uPalette[0];
+    float bestDist = dot(color - uPalette[0], color - uPalette[0]);
+    for (int i = 1; i < PALETTE_SIZE; i++) {
+      vec3 diff = color - uPalette[i];
+      float d = dot(diff, diff);
+      if (d < bestDist) {
+        bestDist = d;
+        best = uPalette[i];
+      }
+    }
+    return best;
+  }
 
   void main() {
     // Iter 6: hard square cells. We do NOT test gl_PointCoord distance so the
@@ -79,6 +103,11 @@ const fragmentShader = /* glsl */ `
     // Luma via Rec.601 weights (GLSL r169-valid; no nonexistent functions used).
     float luma = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
     vec3 finalRgb = luma < uVoidThreshold ? uVoidColor : texColor.rgb;
+
+    // Iter 9 — Palette LUT wired but not applied yet (uPaletteMix defaults to 0.0).
+    // mix(finalRgb, quantized, 0.0) == finalRgb → zero visual change vs iter 8.
+    vec3 quantized = nearestPaletteColor(finalRgb);
+    finalRgb = mix(finalRgb, quantized, uPaletteMix);
 
     gl_FragColor = vec4(finalRgb, 1.0);
   }
@@ -233,6 +262,13 @@ export default function Mosaic() {
       // uVoidThreshold: luma below this snaps to void. 0.12 catches dark
       // background/edge noise without eating the subject (which is much brighter).
       uVoidThreshold: { value: 0.12 },
+      // Iter 9 — Palette LUT uniforms (plumbing; not visually active yet).
+      // paletteAsVector3() returns raw sRGB ratios (same reasoning as uVoidColor).
+      uPalette:       { value: paletteAsVector3() },
+      uPaletteSize:   { value: PALETTE_SIZE },
+      // uPaletteMix = 0.0 → mix() returns finalRgb unchanged → no visual change
+      // vs iter 8. Iter 10 will set this to 1.0 to activate quantization.
+      uPaletteMix:    { value: 0.0 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
