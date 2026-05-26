@@ -28,6 +28,23 @@ const HAND_MODEL_URL =
 const POSE_MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task";
 
+/**
+ * Google-hosted selfie segmenter model (~1 MB, single-class person mask).
+ *
+ * Model: selfie_segmenter (general variant, good for desk/webcam framing).
+ * Outputs a single confidence mask channel (Float32) in [0, 1] per pixel
+ * where 1.0 = definitely person, 0.0 = definitely background.
+ *
+ * URL source:
+ *   https://storage.googleapis.com/mediapipe-models/image_segmenter/
+ *     selfie_segmenter/float16/latest/selfie_segmenter.task
+ *
+ * The "selfie_multiclass" variant (5-class hair/skin/clothing/etc.) is NOT
+ * used here — we only need a binary person vs. background probability.
+ */
+const SEGMENTER_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.task";
+
 // ─── Shared types ───────────────────────────────────────────────────────────
 
 export interface HandLandmarkerHandle {
@@ -44,13 +61,22 @@ export interface PoseLandmarkerHandle {
   close: () => void;
 }
 
+export interface ImageSegmenterHandle {
+  /** The underlying MediaPipe ImageSegmenter instance. */
+  segmenter: import("@mediapipe/tasks-vision").ImageSegmenter;
+  /** Call this to free WASM resources. */
+  close: () => void;
+}
+
 /**
- * Both landmarker handles, created from a single shared FilesetResolver so the
- * WASM bundle is only fetched once.
+ * All three tracking handles, created from a single shared FilesetResolver so
+ * the WASM bundle is only fetched once.
  */
 export interface TrackingHandles {
   hand: HandLandmarkerHandle;
   pose: PoseLandmarkerHandle;
+  /** Iter 18 — selfie segmenter producing a confidence mask for person pixels. */
+  segmenter: ImageSegmenterHandle;
 }
 
 // ─── Factory ─────────────────────────────────────────────────────────────────
@@ -67,11 +93,10 @@ export interface TrackingHandles {
  */
 export async function createTrackingHandles(): Promise<TrackingHandles> {
   // Dynamic import — keeps the WASM loader out of the server bundle.
-  const { FilesetResolver, HandLandmarker, PoseLandmarker } = await import(
-    "@mediapipe/tasks-vision"
-  );
+  const { FilesetResolver, HandLandmarker, PoseLandmarker, ImageSegmenter } =
+    await import("@mediapipe/tasks-vision");
 
-  // ── Single FilesetResolver fetch (shared by both landmarkers) ──────────────
+  // ── Single FilesetResolver fetch (shared by all three trackers) ────────────
   // Derive the type from forVisionTasks's return — WasmFileset is not publicly
   // exported from the package so we cannot reference it directly.
   let vision: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
@@ -82,12 +107,13 @@ export async function createTrackingHandles(): Promise<TrackingHandles> {
     throw err;
   }
 
-  // ── Create both landmarkers in parallel ────────────────────────────────────
+  // ── Create all three trackers in parallel ──────────────────────────────────
   let handLandmarker: import("@mediapipe/tasks-vision").HandLandmarker;
   let poseLandmarker: import("@mediapipe/tasks-vision").PoseLandmarker;
+  let imageSegmenter: import("@mediapipe/tasks-vision").ImageSegmenter;
 
   try {
-    [handLandmarker, poseLandmarker] = await Promise.all([
+    [handLandmarker, poseLandmarker, imageSegmenter] = await Promise.all([
       HandLandmarker.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath: HAND_MODEL_URL,
@@ -104,9 +130,21 @@ export async function createTrackingHandles(): Promise<TrackingHandles> {
         runningMode: "VIDEO",
         numPoses: 1,
       }),
+      // Iter 18 — Selfie segmenter: confidence masks mode gives a Float32 [0,1]
+      // person-probability per pixel, which we upload directly as a DataTexture.
+      // outputCategoryMask is disabled; we use confidence masks for soft edges.
+      ImageSegmenter.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: SEGMENTER_MODEL_URL,
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        outputCategoryMask: false,
+        outputConfidenceMasks: true,
+      }),
     ]);
   } catch (err) {
-    console.error("[tracking] landmarker createFromOptions failed:", err);
+    console.error("[tracking] tracker createFromOptions failed:", err);
     throw err;
   }
 
@@ -118,6 +156,10 @@ export async function createTrackingHandles(): Promise<TrackingHandles> {
     pose: {
       landmarker: poseLandmarker,
       close: () => poseLandmarker.close(),
+    },
+    segmenter: {
+      segmenter: imageSegmenter,
+      close: () => imageSegmenter.close(),
     },
   };
 }
