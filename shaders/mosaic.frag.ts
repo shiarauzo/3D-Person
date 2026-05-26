@@ -206,7 +206,30 @@ const fragmentShader = /* glsl */ `
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
   }
 
-  // synthField: combine vertical body gradient + slow value-noise drift +
+  // Improvement #2 — Fractal noise FBM.
+  //
+  // fbmNoise: 2-3 octave fractal Brownian motion built from valueNoise.
+  //   Octave 1: amplitude 1.0, frequency 1x  — large coherent lime blobs.
+  //   Octave 2: amplitude 0.5, frequency 2x  — mid-scale structure detail.
+  //   Octave 3: amplitude 0.25, frequency 4x — fine grit/corruption detail.
+  //             Weighted in by uNoiseOctaves [0,1]: 0 = 2-octave, 1 = 3-octave.
+  //
+  // The octaves share the same drift so the whole field moves coherently.
+  // Output is normalised back to [0,1] by dividing by the total amplitude sum.
+  float fbmNoise(vec2 cell) {
+    vec2 driftedCell = cell * uNoiseScale + uTime * uNoiseDrift;
+    float n  = valueNoise(driftedCell);               // octave 1
+    float n2 = valueNoise(driftedCell * 2.0 + vec2(17.3, 31.7)); // octave 2
+    float n3 = valueNoise(driftedCell * 4.0 + vec2(53.1, 9.8));  // octave 3
+    // Base: 2-octave sum, total amplitude = 1.5.
+    float base = (n + n2 * 0.5) / 1.5;
+    // Cross-fade in octave 3 (amplitude 0.25) by uNoiseOctaves.
+    // When fully added: total amp = 1.75, so normalise by it.
+    float withThird = (n + n2 * 0.5 + n3 * 0.25) / 1.75;
+    return mix(base, withThird, uNoiseOctaves);
+  }
+
+  // synthField: combine vertical body gradient + fractal value-noise drift +
   // per-cell accent scatter into a single synthetic luma in [0, 1].
   //
   //   vGrad:     vertical body gradient.
@@ -216,14 +239,21 @@ const fragmentShader = /* glsl */ `
   //              the face (small vUv.y) to be hotter/brighter. So we INVERT
   //              vUv.y: gradient = 1 - vUv.y → face≈0.9, chest≈0.1.
   //              A smoothstep over [0.05, 0.95] keeps the range clean.
-  //   nz:        low-frequency value noise driven by uTime drift.
-  //              Scale ~4 means noise has correlation length ≈ 16 cells —
-  //              produces coherent lime regions rather than salt-and-pepper.
-  //              Drift speed 0.07 gives gentle motion at a calm idle.
+  //   nz:        fractal FBM noise (2-3 octaves) driven by uTime drift.
+  //              Produces both large coherent lime blobs AND fine detail.
   //   synthLuma: weighted blend: noise dominant (0.65) for variety, gradient
   //              secondary (0.35) for body-structure bias toward face hotness.
   //
-  // Returns synthLuma in [0, 1]. Caller applies mask-edge boost separately.
+  //   Improvement #2 — Shoulder shading:
+  //   A subtle darkening band at mid-upper V (shoulder zone: vUv.y ≈ 0.30–0.50)
+  //   is added to the noise term so shoulders read as a distinct horizontal
+  //   band between the face and the calmer chest, consistent with the
+  //   reference's tapered-neck / broad-shoulder silhouette. The band is
+  //   narrow and subtle (max 0.08 luma reduction) so it does not fight the
+  //   lime bias or void gate.
+  //
+  // Returns synthLuma in [0, 1]. Caller applies mask-edge boost + face/chest
+  // structure separately.
   //
   // NOTE: synthField takes a 'cell' argument (integer lattice coordinate used
   // for value-noise sampling) but reads the fragment-stage varying vUv.y
@@ -237,13 +267,24 @@ const fragmentShader = /* glsl */ `
     // 'cell' param — see NOTE above.
     float vGrad = smoothstep(0.05, 0.95, 1.0 - vUv.y);
 
-    // Low-frequency value noise: coherent blobs, slow time drift.
-    // uNoiseScale controls spatial frequency; uNoiseDrift controls time speed.
-    float nz = valueNoise(cell * uNoiseScale + uTime * uNoiseDrift);
+    // Improvement #2 — Fractal FBM noise (2-3 octaves).
+    // Replaces single-frequency valueNoise call. Adds mid/fine-scale structure.
+    float nz = fbmNoise(cell);
+
+    // Improvement #2 — Shoulder shading band.
+    // Shoulder zone: vUv.y in [0.30, 0.50] (between face top and chest).
+    // Tent function peaks at vUv.y=0.40 (shoulder centre) and falls to 0 at
+    // the edges. Max 0.08 darkening — enough to distinguish without crushing.
+    float shoulderBand = clamp(1.0 - abs(vUv.y - 0.40) / 0.10, 0.0, 1.0);
+    shoulderBand = shoulderBand * shoulderBand; // soften the peak
+    float shoulderDark = shoulderBand * 0.08;
 
     // Weighted blend: noise share = (1 - uGradientMix), gradient share = uGradientMix.
     // At default uGradientMix=0.35 this equals the prior nz*0.65 + vGrad*0.35.
-    return clamp(nz * (1.0 - uGradientMix) + vGrad * uGradientMix, 0.0, 1.0);
+    float field = nz * (1.0 - uGradientMix) + vGrad * uGradientMix;
+    // Apply subtle shoulder darkening to the noise term only (not the gradient).
+    field -= shoulderDark * (1.0 - uGradientMix);
+    return clamp(field, 0.0, 1.0);
   }
 
   // Iter 22 — Pixel-sort streaks (Kim Asendorf-style horizontal smear).
@@ -354,6 +395,31 @@ const fragmentShader = /* glsl */ `
   uniform float uGradientMix;
   uniform float uEdgeBoost;
   uniform float uLimeMix;
+
+  // Improvement #2 — Body-structure uniforms.
+  //
+  // uFaceFeatures: [0,1] strength of procedural eye + mouth band dips carved
+  //   inside the face bounding region (positioned via uFaceCenter/uFaceRadius).
+  //   0 = no bands (flat face), 1 = full band depth. Default 0.55.
+  //   The eye band sits ~0.25 * radius above face center; the mouth band sits
+  //   ~0.35 * radius below. Both are gated by faceFactor so they move with
+  //   the tracked head and vanish when no face is detected.
+  //
+  // uChestVoid: [0,1] strength of the sternum void-cluster punch in the lower-
+  //   center chest region. At 1.0 a cluster of cells around the lower-center
+  //   vUv area are forced below the void threshold (black holes), matching the
+  //   reference's characteristic hollow chest. Default 0.50.
+  //   Combines additively with the existing lower-body void bias so both
+  //   effects cooperate. Position: lower half (vUv.y > 0.55), center-U band.
+  //
+  // uNoiseOctaves: [0,1] blend weight of the high-frequency octave in the
+  //   fractal noise sum. The base field is always 2-octave FBM
+  //   (1.0 * f1 + 0.5 * f2); uNoiseOctaves cross-fades in a third octave
+  //   (0.25 * f4) for fine corrupted detail.
+  //   0 = 2-octave (smooth blobs), 1 = 3-octave (fine grit added). Default 0.6.
+  uniform float uFaceFeatures;
+  uniform float uChestVoid;
+  uniform float uNoiseOctaves;
 
   void main() {
     // =========================================================================
@@ -624,6 +690,83 @@ const fragmentShader = /* glsl */ `
     // Boost synthLuma at edges (uEdgeBoost) and face; interior body stays mid-range for lime.
     float synthLuma = clamp(baseSynth + edgeFactor * uEdgeBoost + faceFactor * 0.25, 0.0, 1.0);
 
+    // ── Improvement #2: Face feature bands ───────────────────────────────────
+    // Carve a darker EYE band and MOUTH band into the face region so the head
+    // reads as a dissolving face rather than a uniform hot blob.
+    //
+    // Both bands are positioned relative to uFaceCenter/uFaceRadius so they
+    // move with the tracked head. They are gated by faceFactor (falls to 0
+    // outside the face bbox) so they vanish when no face is detected and do
+    // not affect the torso.
+    //
+    // Eye band:   centered at uFaceCenter.y - 0.25 * uFaceRadius (above centre).
+    //   Band half-height = 0.10 * uFaceRadius.  Creates a horizontal dark stripe
+    //   spanning the full face width where the eyes would be.
+    // Mouth band: centered at uFaceCenter.y + 0.35 * uFaceRadius (below centre).
+    //   Band half-height = 0.08 * uFaceRadius.  Narrower stripe for the mouth.
+    //
+    // The darkness of each band is controlled by uFaceFeatures [0,1].
+    // Bands darken (subtract from) synthLuma — they don't force void (that's
+    // the void gate's job); they just lower luma so those cells are more likely
+    // to be picked as a dark/void/black swatch.
+    //
+    // vUv.y coordinate: face center is provided in raw vUv space from
+    // landmarkToVUv, which passes centerY straight through (vUv IS raw video
+    // space; V=0 = top, V=1 = bottom).  uFaceCenter.y is therefore larger
+    // for lower face positions and smaller for higher positions — consistent
+    // with vUv.y conventions everywhere in this shader.
+    {
+      float eyeCenterV   = uFaceCenter.y - 0.25 * uFaceRadius;
+      float mouthCenterV = uFaceCenter.y + 0.35 * uFaceRadius;
+      float halfEye   = uFaceRadius * 0.10;
+      float halfMouth = uFaceRadius * 0.08;
+
+      // Tent functions: 1.0 at the band centre, 0.0 at the band edges.
+      float eyeBand   = clamp(1.0 - abs(vUv.y - eyeCenterV)   / halfEye,   0.0, 1.0);
+      float mouthBand = clamp(1.0 - abs(vUv.y - mouthCenterV) / halfMouth, 0.0, 1.0);
+
+      // Gate by faceFactor so bands only appear on the tracked face.
+      float eyeDark   = eyeBand   * faceFactor * uFaceFeatures * 0.45;
+      float mouthDark = mouthBand * faceFactor * uFaceFeatures * 0.35;
+
+      synthLuma = clamp(synthLuma - eyeDark - mouthDark, 0.0, 1.0);
+    }
+
+    // ── Improvement #2: Chest void cluster ───────────────────────────────────
+    // Punch a cluster of black voids into the lower-center chest / sternum
+    // region, matching the reference image's characteristic hollow holes.
+    //
+    // The cluster is defined by:
+    //   • Lower half: vUv.y > uVoidV0 (same start as the lower-body bias ramp)
+    //   • Center-U band: vUv.x within ±0.12 of 0.50
+    //   • Noise gate: a fast-varying hash per cell produces a patchy cluster
+    //     rather than a solid rectangle (avoids too-regular-looking geometry).
+    //
+    // The cluster adds to the effective void threshold in Step 2 below, which
+    // means it cooperates with — and adds onto — the existing lower-body bias.
+    // The noise gate is a separate hash seed so the cluster pattern is
+    // independent of the accent and chaos hashes.
+    //
+    // uChestVoid [0,1]: 0 = no extra cluster, 1 = strong sternum black holes.
+    // The cluster only activates inside the lower-center zone; outside that zone
+    // the bias is exactly 0 (no effect anywhere else).
+    float chestVoidBias = 0.0;
+    {
+      // Horizontal proximity to U=0.5: 1.0 at center, 0 at ±0.12.
+      float uDist = abs(vUv.x - 0.50);
+      float uBand = clamp(1.0 - uDist / 0.12, 0.0, 1.0);
+      // Vertical: only below uVoidV0 (lower chest / sternum zone).
+      float vStart = uVoidV0; // reuse existing lower-body bias start
+      float lowerFactor = clamp((vUv.y - vStart) / (uVoidV1 - vStart), 0.0, 1.0);
+      // Noise gate: patchy holes rather than a solid block.
+      // Fast cell hash with a unique seed so it's uncorrelated with accents.
+      vec2 chestCell = floor(vUv * 64.0);
+      float chestHash = cellHash(chestCell + vec2(83.0, 127.0));
+      // Only cells where hash < 0.55 are part of the cluster — ~55% fill.
+      float clusterGate = step(chestHash, 0.55);
+      chestVoidBias = uBand * lowerFactor * clusterGate * uChestVoid * 0.30;
+    }
+
     // Keep "luma" as the canonical variable name so all downstream stages
     // (void threshold, palette quantize, accent gate) are unchanged.
     float luma = synthLuma;
@@ -639,7 +782,8 @@ const fragmentShader = /* glsl */ `
     // zero at the face, maximum at the lower chest. This concentrates void holes
     // in the lower chest while leaving the face/shoulders unaffected.
     float t = clamp((vUv.y - uVoidV0) / (uVoidV1 - uVoidV0), 0.0, 1.0);
-    float effectiveThreshold = uVoidThreshold + uVoidLowerBias * t;
+    // Improvement #2: add chest void cluster bias alongside the lower-body ramp.
+    float effectiveThreshold = uVoidThreshold + uVoidLowerBias * t + chestVoidBias;
 
     // Iter 10 — Void-first ordering: dark cells are snapped to void BEFORE the
     // palette lookup so they can never be pulled to a bright neon by the nearest-

@@ -37,6 +37,10 @@ const SLIDERS: SliderSpec[] = [
   { key: "gradientMix",     label: "GRADIENT",    min: 0.00, max: 1.00,  step: 0.01  },
   { key: "edgeBoost",       label: "EDGE",        min: 0.00, max: 1.00,  step: 0.01  },
   { key: "limeMix",         label: "LIME",        min: 0.00, max: 1.00,  step: 0.01  },
+  // Improvement #2 — body-structure knobs.
+  { key: "noiseOctaves",    label: "OCTAVES",     min: 0.00, max: 1.00,  step: 0.01  },
+  { key: "faceFeatures",    label: "FACE FEAT",   min: 0.00, max: 1.00,  step: 0.01  },
+  { key: "chestVoid",       label: "CHEST VOID",  min: 0.00, max: 1.00,  step: 0.01  },
 ];
 
 export default function Controls() {
