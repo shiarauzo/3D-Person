@@ -4,8 +4,8 @@ export default function Home() {
   return (
     <main>
       <div className="overlay">
-        <h1>3D Person</h1>
-        <p>Drag to orbit · scroll to zoom</p>
+        <h1>Glitch Portrait</h1>
+        <p>Webcam mosaic — camera required</p>
       </div>
       <div className="canvas-wrap">
         <SceneLoader />
