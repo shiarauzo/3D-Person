@@ -37,6 +37,12 @@ const vertexShader = /* glsl */ `
     // visible range [-half, +half]; z=0 keeps points on the near plane.
     gl_Position  = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     gl_PointSize = uPointSize;
+    // NOTE (iter 7 trigger): the WebGL spec allows drivers to clamp
+    // gl_PointSize at ALIASED_POINT_SIZE_RANGE[1], typically 64–1024 px.
+    // If increasing grid density causes cells to shrink below the driver
+    // clamp (visible as all points collapsing to the minimum size), switch
+    // to InstancedMesh quads (PLAN.md iter 7 fallback) — InstancedMesh is
+    // not subject to the gl_PointSize limit.
   }
 `;
 
@@ -46,15 +52,15 @@ const fragmentShader = /* glsl */ `
   varying vec2 vUv;
 
   void main() {
-    // Discard fragments outside the circular point sprite boundary so each
-    // cell is a filled square rather than a circle — we simply keep the full
-    // quad by NOT using gl_PointCoord distance test (square cells desired).
+    // Iter 6: hard square cells. We do NOT test gl_PointCoord distance so the
+    // full point-sprite quad is filled — no circular masking, no discard, no
+    // alpha smoothstep. Every fragment within the point gets the same sampled
+    // color, producing a hard aliased square cell with no soft edges.
     //
-    // Color path: tex.colorSpace = THREE.NoColorSpace means the GPU samples
-    // raw bytes with no color-space conversion applied by Three.js. The video
-    // stream is natively sRGB-encoded, so the sampled values are already in
-    // display-ready sRGB — output them directly. The renderer's output
-    // colorspace is also sRGB, so there is no double-encode.
+    // Color path: tex.colorSpace = THREE.NoColorSpace → GPU samples raw bytes
+    // with no Three.js color-space conversion. The video stream is natively
+    // sRGB; we output it directly. The renderer output colorspace is also sRGB,
+    // so there is no double-encode.
     gl_FragColor = texture2D(uVideo, vUv);
   }
 `;
@@ -77,8 +83,10 @@ export default function Mosaic() {
   const squarePx = Math.min(size.width, size.height);
 
   // Cell size in physical pixels (DPR-scaled so points tile without gaps).
+  // The *1.02 nudge closes sub-pixel gaps that appear at some DPR values;
+  // keep the factor close to 1.0 to avoid heavy overlap between cells.
   const dpr = gl.getPixelRatio();
-  const cellPx = (squarePx / GRID_W) * dpr;
+  const cellPx = (squarePx / GRID_W) * dpr * 1.02;
 
   // -------------------------------------------------------------------------
   // VideoTexture
@@ -256,6 +264,10 @@ export default function Mosaic() {
         vertexShader={vertexShader}
         fragmentShader={fragmentShader}
         uniforms={uniforms}
+        // Iter 6: hard square cells — no alpha blending that could soften edges.
+        transparent={false}
+        depthWrite={true}
+        depthTest={true}
         // sizeAttenuation=false is the default for ShaderMaterial with
         // gl_PointSize; we handle sizing explicitly in the vertex shader.
       />
