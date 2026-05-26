@@ -60,6 +60,16 @@ const fragmentShader = /* glsl */ `
   uniform sampler2D uVideo;
   uniform vec3  uVoidColor;       // near-black void (#0a0f0a)  iter 8
   uniform float uVoidThreshold;   // base luma threshold; below this → snap to void  iter 8/12
+  // Iter 13 — Accent scatter.
+  // uAccentAmount: probability [0,1] that a non-void cell is overridden with a
+  // random accent swatch (palette indices 3..7: magenta, cyan, blue, red, amber).
+  // Default ~0.12 keeps accents a clear minority (~12 % of body cells).
+  uniform float uAccentAmount;
+  // The five accent colors (raw sRGB, matching lib/palette.ts indices 3..7).
+  // A separate array avoids re-indexing the main uPalette[] in the hot path.
+  #define ACCENT_COUNT 5
+  uniform vec3  uAccents[ACCENT_COUNT]; // [magenta, cyan, blue, red, amber]
+
   // Iter 12 — Lower-body void bias.
   // Adds a small amount to the effective void threshold for cells in the lower
   // part of the frame, so darker body shadows (especially lower chest) collapse
@@ -151,6 +161,15 @@ const fragmentShader = /* glsl */ `
     return best;
   }
 
+  // Iter 13 — Per-cell pseudo-random hash.
+  // Classic Perlin/Shadertoy hash: fract(sin(dot(cell, K)) * M).
+  // cell = floor(vUv * GRID_W) gives a unique integer pair per mosaic cell;
+  // the two magic constants produce well-distributed values across the grid.
+  // Returns a stable float in [0, 1) for the given cell coordinate.
+  float cellHash(vec2 cell) {
+    return fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
+  }
+
   void main() {
     // Iter 6: hard square cells. We do NOT test gl_PointCoord distance so the
     // full point-sprite quad is filled — no circular masking, no discard, no
@@ -193,6 +212,37 @@ const fragmentShader = /* glsl */ `
     // Iter 11: pass luma so nearestPaletteColor can apply mid-band lime bias.
     vec3 quantized = nearestPaletteColor(preQuantize, luma);
     vec3 finalRgb = mix(preQuantize, quantized, uPaletteMix);
+
+    // Iter 13 — Accent scatter: sprinkle random accent pops over non-void cells.
+    // Strategy: derive a stable per-cell coordinate from vUv, then draw two hashes
+    // — one to decide IF this cell gets an accent, one to pick WHICH accent color.
+    // Void cells (luma < effectiveThreshold) are left untouched.
+    if (luma >= effectiveThreshold) {
+      // Cell grid coordinate — integer pair, one per mosaic square.
+      // float(GRID_W/GRID_H) must be a literal constant for GLSL ES.
+      vec2 cell = floor(vUv * 64.0);
+
+      // First hash: scatter probability gate.
+      float h1 = cellHash(cell);
+      if (h1 < uAccentAmount) {
+        // Second hash (offset seed so it's independent of h1): pick accent index.
+        float h2 = cellHash(cell + vec2(57.0, 31.0));
+        // Map h2 uniformly onto [0, ACCENT_COUNT-1].
+        int accentIdx = int(h2 * float(ACCENT_COUNT));
+        // Clamp in case h2 == 1.0 exactly.
+        accentIdx = accentIdx < ACCENT_COUNT ? accentIdx : ACCENT_COUNT - 1;
+
+        // Select accent color.  GLSL ES 1.0 requires constant loop / array index;
+        // use an if-chain (5 branches, trivially unrolled by the driver).
+        vec3 accentColor = uAccents[0];
+        if (accentIdx == 1) accentColor = uAccents[1];
+        if (accentIdx == 2) accentColor = uAccents[2];
+        if (accentIdx == 3) accentColor = uAccents[3];
+        if (accentIdx == 4) accentColor = uAccents[4];
+
+        finalRgb = accentColor;
+      }
+    }
 
     gl_FragColor = vec4(finalRgb, 1.0);
   }
@@ -378,6 +428,21 @@ export default function Mosaic() {
       // Green swatch indices: 1 = Acid Lime (#c8f000), 2 = Toxic Green (#39ff5a)
       // — matches lib/palette.ts PALETTE_HEXES ordering.
       uLimeBias:      { value: 0.5 },
+      // Iter 13 — Accent scatter uniforms.
+      // uAccentAmount: probability a non-void cell becomes an accent pop.
+      // 0.12 = ~12 % of body cells → minority scatter, not a uniform blob.
+      uAccentAmount:  { value: 0.12 },
+      // uAccents: raw sRGB vec3 for palette indices 3..7 (magenta→amber).
+      // Parsed manually (same reason as uVoidColor: avoid ColorManagement shift).
+      uAccents: {
+        value: [
+          new THREE.Vector3(0xff / 255, 0x2b / 255, 0xb5 / 255), // 3 Hot Magenta  #ff2bb5
+          new THREE.Vector3(0x19 / 255, 0xe0 / 255, 0xe6 / 255), // 4 Electric Cyan #19e0e6
+          new THREE.Vector3(0x21 / 255, 0x56 / 255, 0xff / 255), // 5 Cobalt Blue   #2156ff
+          new THREE.Vector3(0xff / 255, 0x2a / 255, 0x2a / 255), // 6 Signal Red    #ff2a2a
+          new THREE.Vector3(0xff / 255, 0x9c / 255, 0x2b / 255), // 7 Amber         #ff9c2b
+        ],
+      },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
