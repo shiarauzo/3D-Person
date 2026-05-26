@@ -181,6 +181,10 @@ const POSE_INTERVAL_MS = 1000 / POSE_FPS; // ~67 ms
 /** Derived minimum interval (ms) between segmentation calls. */
 const SEG_INTERVAL_MS = 1000 / SEG_FPS; // ~67 ms
 
+// Watchdog for the duplicate-frame guard: if video.currentTime appears frozen
+// for this long, run inference anyway so tracking can never permanently stall.
+const STALL_FALLBACK_MS = 250;
+
 /**
  * Iter 18 — Segmentation mask texture resolution.
  * 256×256 is small enough to upload cheaply every frame while giving the
@@ -321,6 +325,12 @@ export function useTracking({
     // otherwise call detectForVideo on the same frame twice, burning CPU/GPU for
     // zero new information).
     let lastVideoTime = -1;
+    // Watchdog: wall-clock time of the last inference pass we actually ran.
+    // If video.currentTime stops advancing (some browsers throttle the decode
+    // of an off-screen/hidden video, or coarsen the timer), the duplicate-frame
+    // guard below must NOT starve tracking forever — so we force a pass after
+    // STALL_FALLBACK_MS even when currentTime looks unchanged.
+    let lastInferenceWallTime = -1;
     // Throttle hand-count state updates to avoid flooding React with renders.
     let lastHandCountUpdate = 0;
     // Log detect errors at most once so the console isn't spammed each frame.
@@ -405,11 +415,14 @@ export function useTracking({
             // starvation, no duplicate inference) — just lower than the configured
             // HAND/POSE/SEG_FPS targets; the per-frame lerps keep motion smooth.
             const currentVideoTime = video.currentTime;
-            if (currentVideoTime === lastVideoTime) {
+            const frameAdvanced = currentVideoTime !== lastVideoTime;
+            const stalled = now - lastInferenceWallTime >= STALL_FALLBACK_MS;
+            if (!frameAdvanced && !stalled) {
               rafId = requestAnimationFrame(detectFrame);
               return;
             }
             lastVideoTime = currentVideoTime;
+            lastInferenceWallTime = now;
 
             // ── Perf #8: Hand detect (throttled to HAND_FPS ≈ 30 fps) ─────────
             // Hands drive the deform effect — kept at 30 fps for responsive feel.

@@ -94,14 +94,24 @@ main {
 }
 
 /* iter-03: permission gate */
+/*
+ * The webcam <video> is the MediaPipe input only (never displayed). It must
+ * stay DECODING frames, but in v2 the VideoTexture that used to pull frames
+ * was removed — so a 0x0 / off-screen video can get its decode pipeline
+ * throttled (frozen video.currentTime) by the browser, which silently stalls
+ * tracking and leaves the canvas void-black. Keep it a real (tiny) size and
+ * IN the viewport (a corner), just visually hidden (opacity 0, behind the
+ * canvas), so frames keep advancing.
+ */
 .webcam-hidden {
   position: fixed;
-  width: 0;
-  height: 0;
+  bottom: 0;
+  right: 0;
+  width: 64px;
+  height: 48px;
   opacity: 0;
   pointer-events: none;
-  top: -9999px;
-  left: -9999px;
+  z-index: -1;
 }
 
 .gate-overlay {
