@@ -13,10 +13,11 @@ const DEBUG_HANDS = true;
 export default function CameraGate() {
   const { videoRef, status, error, start } = useWebcamContext();
 
-  // Iter 16: consume the shared tracking context (single detect loop owned by
+  // Iter 16+: consume the shared tracking context (single detect loop owned by
   // TrackingProvider). Do NOT call useTracking here — that would start a second
   // detect loop and double the MediaPipe CPU cost.
-  const { landmarksRef, handCount } = useTrackingContext();
+  // Iter 17: also read poseRef + faceBboxRef for debug overlay.
+  const { landmarksRef, handCount, poseRef, faceBboxRef } = useTrackingContext();
 
   return (
     <>
@@ -31,9 +32,13 @@ export default function CameraGate() {
         aria-hidden="true"
       />
 
-      {/* Debug overlay: mirrored landmark dots confirming hand tracking. */}
+      {/* Debug overlay: mirrored hand dots + pose face bbox (iter 17). */}
       {DEBUG_HANDS && status === "ready" && (
-        <HandDebugOverlay landmarksRef={landmarksRef} />
+        <HandDebugOverlay
+          landmarksRef={landmarksRef}
+          poseRef={poseRef}
+          faceBboxRef={faceBboxRef}
+        />
       )}
 
       {/* Optional HUD: hand count (only shown when debug is on and hands are seen). */}
