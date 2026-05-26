@@ -2,13 +2,23 @@
 
 import { useWebcamContext } from "@/context/webcam-context";
 import { useTracking } from "@/hooks/use-tracking";
+import HandDebugOverlay from "@/components/hand-debug-overlay";
+
+/**
+ * Toggle to show the hand-landmark debug dots over the video.
+ * Flip to false (or remove the overlay entirely) once iter 16 is validated.
+ */
+const DEBUG_HANDS = true;
 
 export default function CameraGate() {
   const { videoRef, status, error, start } = useWebcamContext();
 
   // Bootstrap MediaPipe tracking once the camera is live.
-  // Iter 14: init + teardown only. Per-frame detect loop added in iter 15.
-  useTracking({ videoRef, enabled: status === "ready" });
+  // Iter 15: rAF detect loop active; exposes landmarksRef + handCount.
+  const { landmarksRef, handCount } = useTracking({
+    videoRef,
+    enabled: status === "ready",
+  });
 
   return (
     <>
@@ -22,6 +32,33 @@ export default function CameraGate() {
         className="webcam-hidden"
         aria-hidden="true"
       />
+
+      {/* Debug overlay: mirrored landmark dots confirming hand tracking. */}
+      {DEBUG_HANDS && status === "ready" && (
+        <HandDebugOverlay landmarksRef={landmarksRef} />
+      )}
+
+      {/* Optional HUD: hand count (only shown when debug is on and hands are seen). */}
+      {DEBUG_HANDS && status === "ready" && handCount > 0 && (
+        <div
+          style={{
+            position: "fixed",
+            top: 12,
+            right: 12,
+            color: "#00ff88",
+            fontFamily: "monospace",
+            fontSize: 12,
+            pointerEvents: "none",
+            zIndex: 10000,
+            background: "rgba(0,0,0,0.55)",
+            padding: "2px 8px",
+            borderRadius: 4,
+          }}
+          aria-live="polite"
+        >
+          hands: {handCount}
+        </div>
+      )}
 
       {status !== "ready" && (
         <div className="gate-overlay" role="dialog" aria-modal="true" aria-label="Camera permission">
