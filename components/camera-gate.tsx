@@ -1,7 +1,7 @@
 "use client";
 
 import { useWebcamContext } from "@/context/webcam-context";
-import { useTracking } from "@/hooks/use-tracking";
+import { useTrackingContext } from "@/context/tracking-context";
 import HandDebugOverlay from "@/components/hand-debug-overlay";
 
 /**
@@ -13,12 +13,10 @@ const DEBUG_HANDS = true;
 export default function CameraGate() {
   const { videoRef, status, error, start } = useWebcamContext();
 
-  // Bootstrap MediaPipe tracking once the camera is live.
-  // Iter 15: rAF detect loop active; exposes landmarksRef + handCount.
-  const { landmarksRef, handCount } = useTracking({
-    videoRef,
-    enabled: status === "ready",
-  });
+  // Iter 16: consume the shared tracking context (single detect loop owned by
+  // TrackingProvider). Do NOT call useTracking here — that would start a second
+  // detect loop and double the MediaPipe CPU cost.
+  const { landmarksRef, handCount } = useTrackingContext();
 
   return (
     <>
