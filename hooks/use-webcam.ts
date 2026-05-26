@@ -15,19 +15,27 @@ export interface UseWebcamReturn {
 export function useWebcam(): UseWebcamReturn {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  // Tracks whether the hook is still mounted so async callbacks in start()
+  // never call setState after unmount (avoids the React warning and the
+  // possibility of a queued setState racing with the unmount cleanup).
+  const mountedRef = useRef(true);
   const [status, setStatus] = useState<WebcamStatus>("idle");
   const [error, setError] = useState<string | null>(null);
 
   const start = useCallback(async () => {
     // SSR guard — navigator is not available on the server
     if (typeof navigator === "undefined" || !navigator.mediaDevices) {
-      setStatus("error");
-      setError("MediaDevices API not available");
+      if (mountedRef.current) {
+        setStatus("error");
+        setError("MediaDevices API not available");
+      }
       return;
     }
 
-    setStatus("requesting");
-    setError(null);
+    if (mountedRef.current) {
+      setStatus("requesting");
+      setError(null);
+    }
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -39,12 +47,19 @@ export function useWebcam(): UseWebcamReturn {
         audio: false,
       });
 
+      // Guard: component may have unmounted while getUserMedia was pending.
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
       streamRef.current = stream;
 
       const video = videoRef.current;
       if (!video) {
         // Component unmounted between the async call and now
         stream.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
         return;
       }
 
@@ -84,9 +99,14 @@ export function useWebcam(): UseWebcamReturn {
         timeoutId = setTimeout(onTimeout, 8000);
       });
 
+      // Guard: check again after the async wait (unmount may have raced).
+      if (!mountedRef.current) return;
+
       await video.play();
-      setStatus("ready");
+
+      if (mountedRef.current) setStatus("ready");
     } catch (err) {
+      if (!mountedRef.current) return;
       if (err instanceof DOMException && err.name === "NotAllowedError") {
         setStatus("denied");
         setError("Camera permission denied");
@@ -98,6 +118,8 @@ export function useWebcam(): UseWebcamReturn {
   }, []);
 
   const stop = useCallback(() => {
+    // Always tear down the stream so the camera indicator turns off,
+    // regardless of whether the component is still mounted.
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
@@ -105,13 +127,27 @@ export function useWebcam(): UseWebcamReturn {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-    setStatus("idle");
-    setError(null);
+    // Only update React state when still mounted. The unmount cleanup calls
+    // stop() after setting mountedRef.current = false, so we skip setState
+    // there to avoid the "Can't perform a React state update on an unmounted
+    // component" warning while still releasing the camera above.
+    if (mountedRef.current) {
+      setStatus("idle");
+      setError(null);
+    }
   }, []);
 
   // Cleanup on unmount (and on Strict-Mode double-invoke): stop the camera
   // so the MediaStream is released and the browser indicator turns off.
-  useEffect(() => stop, [stop]);
+  // Also mark the hook as unmounted so any in-flight start() async continuations
+  // skip their setState calls.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      stop();
+    };
+  }, [stop]);
 
   return { videoRef, status, error, start, stop };
 }

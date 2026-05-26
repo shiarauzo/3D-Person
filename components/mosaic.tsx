@@ -984,7 +984,8 @@ export default function Mosaic() {
     return tex;
   }, [videoRef, status]);
 
-  // Dispose texture on unmount.
+  // Dispose texture on unmount / when the texture reference changes.
+  // VideoTexture is created imperatively in useMemo so R3F will not auto-dispose it.
   useEffect(() => {
     return () => {
       texture?.dispose();
@@ -1061,6 +1062,15 @@ export default function Mosaic() {
 
     return geo;
   }, [squarePx]);
+
+  // Dispose geometry on unmount / when squarePx changes and geometry is rebuilt.
+  // BufferGeometry is created imperatively in useMemo; R3F only auto-disposes
+  // objects it created from JSX primitives (<bufferGeometry />) — not useMemo instances.
+  useEffect(() => {
+    return () => {
+      geometry.dispose();
+    };
+  }, [geometry]);
 
   // -------------------------------------------------------------------------
   // ShaderMaterial uniforms

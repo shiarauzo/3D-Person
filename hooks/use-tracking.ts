@@ -260,7 +260,17 @@ export function useTracking({
   const poseRef = useRef<PoseLandmarkerResult | null>(null);
   const faceBboxRef = useRef<FaceBbox>({ centerX: 0.5, centerY: 0.3, radius: 0.15, active: false });
   const maskTextureRef = useRef<THREE.DataTexture | null>(null);
+  const mountedRef = useRef(true);
   const [handCount, setHandCount] = useState(0);
+
+  // Track component mount lifetime so cleanup callbacks can skip setState
+  // after the component has unmounted (avoids React's setState-on-unmounted warning).
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     // Only run in the browser — WASM cannot load server-side.
@@ -411,6 +421,14 @@ export function useTracking({
                   video,
                   now,
                   (segResult) => {
+                    // Guard: if the effect was cancelled while the segmentation
+                    // callback was in-flight, discard the result entirely.
+                    // Without this guard, the callback would allocate a new
+                    // DataTexture (maskTextureRef.current is null after disposal)
+                    // and store it in the ref — leaking GPU memory with no owner
+                    // to dispose it.
+                    if (cancelled) return;
+
                     const masks = segResult.confidenceMasks;
                     if (!masks || masks.length === 0) return;
 
@@ -510,7 +528,13 @@ export function useTracking({
         maskTextureRef.current.dispose();
         maskTextureRef.current = null;
       }
-      setHandCount(0);
+      // Only reset React state when the component is still mounted.
+      // On hard unmount, mountedRef.current is false (set by the lifecycle
+      // effect above) so we skip the setState. When `enabled` toggles to false
+      // the component stays mounted and the reset goes through normally.
+      if (mountedRef.current) {
+        setHandCount(0);
+      }
     };
   }, [enabled, videoRef]);
 
