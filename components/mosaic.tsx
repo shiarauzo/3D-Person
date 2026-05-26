@@ -61,7 +61,7 @@ const fragmentShader = /* glsl */ `
   uniform vec3  uVoidColor;      // near-black void (#0a0f0a)  iter 8
   uniform float uVoidThreshold;  // luma below this → snap to void  iter 8
 
-  // Iter 9 — Palette LUT (plumbing; not applied yet).
+  // Iter 9/10 — Palette LUT.
   // GLSL ES requires a compile-time constant for array size — use #define.
   #define PALETTE_SIZE 9
   uniform vec3  uPalette[PALETTE_SIZE]; // raw sRGB vec3 per color
@@ -70,14 +70,26 @@ const fragmentShader = /* glsl */ `
 
   varying vec2 vUv;
 
-  // Iter 9 helper: find the nearest palette entry by squared RGB distance.
-  // Called here to prove compilation; result is only blended in when uPaletteMix > 0.
+  // Iter 10 helper: find the nearest palette entry using luma-weighted squared
+  // distance. Weighting each channel by its Rec.601 luma coefficient
+  // (r*0.299, g*0.587, b*0.114) means the distance is computed in a perceptual
+  // space so that skin/body tones map to the closest-feeling neon rather than
+  // collapsing arbitrarily. The loop bound is the compile-time constant
+  // PALETTE_SIZE — GLSL ES requires a constant upper bound.
   vec3 nearestPaletteColor(vec3 color) {
+    // Luma weights (Rec.601) — same as the void-floor luma calculation.
+    vec3 lumaW = vec3(0.299, 0.587, 0.114);
+    vec3 wColor = color * lumaW;
+
     vec3 best = uPalette[0];
-    float bestDist = dot(color - uPalette[0], color - uPalette[0]);
+    vec3 wEntry = uPalette[0] * lumaW;
+    vec3 wDiff  = wColor - wEntry;
+    float bestDist = dot(wDiff, wDiff);
+
     for (int i = 1; i < PALETTE_SIZE; i++) {
-      vec3 diff = color - uPalette[i];
-      float d = dot(diff, diff);
+      vec3 wE = uPalette[i] * lumaW;
+      vec3 wd = wColor - wE;
+      float d = dot(wd, wd);
       if (d < bestDist) {
         bestDist = d;
         best = uPalette[i];
@@ -102,12 +114,18 @@ const fragmentShader = /* glsl */ `
     // background noise merges seamlessly with the scene background (#0a0f0a).
     // Luma via Rec.601 weights (GLSL r169-valid; no nonexistent functions used).
     float luma = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
-    vec3 finalRgb = luma < uVoidThreshold ? uVoidColor : texColor.rgb;
 
-    // Iter 9 — Palette LUT wired but not applied yet (uPaletteMix defaults to 0.0).
-    // mix(finalRgb, quantized, 0.0) == finalRgb → zero visual change vs iter 8.
-    vec3 quantized = nearestPaletteColor(finalRgb);
-    finalRgb = mix(finalRgb, quantized, uPaletteMix);
+    // Iter 10 — Void-first ordering: dark cells are snapped to void BEFORE the
+    // palette lookup so they can never be pulled to a bright neon by the nearest-
+    // color search. Only above-threshold cells enter nearestPaletteColor, where
+    // all 9 palette entries (including void black at index 0) are candidates —
+    // near-dark-but-above-threshold cells will naturally pick void black anyway.
+    vec3 preQuantize = luma < uVoidThreshold ? uVoidColor : texColor.rgb;
+
+    // Quantize to the nearest neon swatch (luma-weighted perceptual distance).
+    // uPaletteMix = 1.0 → full quantization; = 0.0 → pass-through (iter 8 mode).
+    vec3 quantized = nearestPaletteColor(preQuantize);
+    vec3 finalRgb = mix(preQuantize, quantized, uPaletteMix);
 
     gl_FragColor = vec4(finalRgb, 1.0);
   }
@@ -266,9 +284,9 @@ export default function Mosaic() {
       // paletteAsVector3() returns raw sRGB ratios (same reasoning as uVoidColor).
       uPalette:       { value: paletteAsVector3() },
       uPaletteSize:   { value: PALETTE_SIZE },
-      // uPaletteMix = 0.0 → mix() returns finalRgb unchanged → no visual change
-      // vs iter 8. Iter 10 will set this to 1.0 to activate quantization.
-      uPaletteMix:    { value: 0.0 },
+      // Iter 10 — uPaletteMix = 1.0 activates full palette quantization.
+      // Every non-void cell is snapped to its nearest neon swatch; no mid-tones.
+      uPaletteMix:    { value: 1.0 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
