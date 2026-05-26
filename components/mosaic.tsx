@@ -262,7 +262,8 @@ const fragmentShader = /* glsl */ `
   // COORDINATE NOTE (traced from aUv construction in JS):
   //   row=0 (screen-bottom, lower chest) → aUv.y = vMaxZ ≈ 0.90  (LARGE)
   //   row=63 (screen-top, face)          → aUv.y = vMinZ ≈ 0.10  (SMALL)
-  // VideoTexture flipY=false: V=0 = top of video (face), V=1 = bottom (chest).
+  // The video element (MediaPipe input) has V=0 at the top (face) and V=1 at
+  // the bottom (chest). The mask DataTexture shares this orientation.
   // The (1-normRow) flip in the JS maps screen-bottom rows to high V values.
   // Therefore vUv.y is LARGE at the lower chest and SMALL at the face.
   //
@@ -393,8 +394,17 @@ const fragmentShader = /* glsl */ `
   //              secondary (0.35) for body-structure bias toward face hotness.
   //
   // Returns synthLuma in [0, 1]. Caller applies mask-edge boost separately.
+  //
+  // NOTE: synthField takes a 'cell' argument (integer lattice coordinate used
+  // for value-noise sampling) but reads the fragment-stage varying vUv.y
+  // directly for the vertical gradient — intentional. The gradient must be in
+  // screen-space UV (face-at-top stays hot regardless of which lattice cell is
+  // passed in), while 'cell' drives the spatially-coherent noise. Mixing the
+  // two is by design, not a mistake.
   float synthField(vec2 cell) {
-    // Vertical gradient: face region → high (bright/hot), chest → low (calm).
+    // Vertical gradient: face region (small vUv.y) → high / bright/hot;
+    // chest (large vUv.y) → low / calm. Reads vUv.y (screen-space V), not the
+    // 'cell' param — see NOTE above.
     float vGrad = smoothstep(0.05, 0.95, 1.0 - vUv.y);
 
     // Low-frequency value noise: coherent blobs, slow time drift.
@@ -791,8 +801,9 @@ const fragmentShader = /* glsl */ `
     // Iter 12 — Effective void threshold with lower-body spatial bias.
     // vUv.y is LARGE at the lower chest (~0.90) and SMALL at the face (~0.10)
     // because row=0 (screen-bottom / lower chest) maps to aUv.y = vMaxZ ≈ 0.90
-    // via the (1 - normRow) flip in the JS geometry builder, and VideoTexture
-    // uses flipY=false so V increases toward the bottom of the video frame.
+    // via the (1 - normRow) flip in the JS geometry builder. The video element
+    // (and mask DataTexture) have V=0 at the top (face), so V increases toward
+    // the bottom of the frame (chest).
     // The ramp t goes from 0.0 (at or below uVoidV0, face region) to 1.0 (at or
     // above uVoidV1, lower-chest region). The additive bias is uVoidLowerBias * t:
     // zero at the face, maximum at the lower chest. This concentrates void holes
