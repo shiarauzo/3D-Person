@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import * as THREE from "three";
 import type { TrackingHandles } from "@/lib/tracking/mediapipe";
 import type { HandLandmarkerResult, PoseLandmarkerResult } from "@mediapipe/tasks-vision";
@@ -42,7 +42,18 @@ export interface FaceBbox {
   active: boolean;
 }
 
+/** Model loading / init lifecycle. */
+export type TrackingInitStatus = "idle" | "loading" | "ready" | "error";
+
 export interface UseTrackingResult {
+  /**
+   * Model-loading state machine.
+   *   "idle"    — tracking not yet started (camera not ready).
+   *   "loading" — WASM + model files are downloading (1–5 s gap).
+   *   "ready"   — all models loaded; detect loop is running.
+   *   "error"   — createTrackingHandles threw (e.g. CDN down).
+   */
+  initStatus: TrackingInitStatus;
   /**
    * Ref holding the latest HandLandmarkerResult (populated every rAF frame).
    * Read this in your own rAF / useFrame — NOT reactive, no re-render cost.
@@ -84,6 +95,8 @@ export interface UseTrackingResult {
   landmarksRef: React.RefObject<HandLandmarkerResult | null>;
   /** Reactive hand count (0, 1, or 2). Updated at most once per second. */
   handCount: number;
+  /** Call to retry after an "error" initStatus. Re-runs the init effect. */
+  retryInit: () => void;
   /**
    * Ref holding the latest PoseLandmarkerResult (populated every rAF frame).
    * 33 normalized landmarks per detected pose. RAW (unmirrored) space.
@@ -262,6 +275,11 @@ export function useTracking({
   const maskTextureRef = useRef<THREE.DataTexture | null>(null);
   const mountedRef = useRef(true);
   const [handCount, setHandCount] = useState(0);
+  const [initStatus, setInitStatus] = useState<TrackingInitStatus>("idle");
+  // Stable retry callback: re-enable tracking by toggling `enabled` externally
+  // isn't possible from inside the hook, so we expose a retryCount to force the effect to re-run.
+  const [retryCount, setRetryCount] = useState(0);
+  const retryInit = useCallback(() => setRetryCount((n) => n + 1), []);
 
   // Track component mount lifetime so cleanup callbacks can skip setState
   // after the component has unmounted (avoids React's setState-on-unmounted warning).
@@ -300,6 +318,8 @@ export function useTracking({
         return;
       }
 
+      if (mountedRef.current) setInitStatus("loading");
+
       try {
         // Lazy import — createTrackingHandles does the dynamic import of
         // @mediapipe/tasks-vision, so nothing from that package runs server-side.
@@ -321,6 +341,7 @@ export function useTracking({
         }
 
         handlesRef.current = handles;
+        if (mountedRef.current) setInitStatus("ready");
         console.log("[tracking] hand + pose landmarkers ready — starting detect loop");
 
         // ── rAF detect loop ────────────────────────────────────────────────
@@ -504,6 +525,7 @@ export function useTracking({
       } catch (err) {
         if (!cancelled) {
           console.error("[tracking] init failed:", err);
+          if (mountedRef.current) setInitStatus("error");
         }
       }
     }
@@ -534,9 +556,10 @@ export function useTracking({
       // the component stays mounted and the reset goes through normally.
       if (mountedRef.current) {
         setHandCount(0);
+        setInitStatus("idle");
       }
     };
-  }, [enabled, videoRef]);
+  }, [enabled, videoRef, retryCount]);
 
-  return { landmarksRef, handCount, poseRef, faceBboxRef, maskTextureRef };
+  return { landmarksRef, handCount, poseRef, faceBboxRef, maskTextureRef, initStatus, retryInit };
 }

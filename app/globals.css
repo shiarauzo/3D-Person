@@ -114,6 +114,12 @@ main {
   z-index: 50;
 }
 
+/* Task 1: semi-transparent loading overlay — canvas still visible beneath. */
+.gate-overlay--transparent {
+  background: rgba(10, 15, 10, 0.55);
+  pointer-events: none;
+}
+
 .gate-panel {
   display: flex;
   flex-direction: column;
@@ -176,6 +182,59 @@ main {
 .gate-message--error {
   color: #ff2a2a;
   opacity: 0.85;
+}
+
+/* Task 2: WebGL not supported full-page message. */
+.webgl-unavailable {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: #0a0f0a;
+  font-family: ui-monospace, "Geist Mono", "IBM Plex Mono", monospace;
+  text-align: center;
+  padding: 0 24px;
+}
+
+.webgl-unavailable__title {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: #ff2a2a;
+  opacity: 0.85;
+}
+
+.webgl-unavailable__body {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: #e7e9ee;
+  opacity: 0.45;
+  line-height: 1.7;
+}
+
+/* Task 4: no-person hint — bottom-center, subtle mono text.
+   Opacity toggled imperatively via ref (no React re-render on every frame).
+   transition gives a gentle fade in/out. */
+.no-person-hint {
+  position: fixed;
+  bottom: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: ui-monospace, "Geist Mono", "IBM Plex Mono", monospace;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: #e7e9ee;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 15;
+  transition: opacity 600ms ease;
+  white-space: nowrap;
 }
 
 /* iter-29: live control panel (top-right, collapsible, mono/neon) */

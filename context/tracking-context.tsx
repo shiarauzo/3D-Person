@@ -32,7 +32,10 @@ import {
   type ReactNode,
 } from "react";
 import { useWebcamContext } from "@/context/webcam-context";
-import { useTracking, type UseTrackingResult } from "@/hooks/use-tracking";
+import { useTracking, type UseTrackingResult, type TrackingInitStatus } from "@/hooks/use-tracking";
+
+// Re-export for consumers that import from this module.
+export type { TrackingInitStatus };
 
 // Exported so DemoTrackingProvider can share the same context object,
 // letting all consumers (Mosaic, Hud, CameraGate) work identically in demo mode.

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export type WebcamStatus = "idle" | "requesting" | "ready" | "denied" | "error";
+export type WebcamStatus = "idle" | "requesting" | "ready" | "denied" | "error" | "unsupported";
 
 export interface UseWebcamReturn {
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -24,10 +24,12 @@ export function useWebcam(): UseWebcamReturn {
 
   const start = useCallback(async () => {
     // SSR guard — navigator is not available on the server
-    if (typeof navigator === "undefined" || !navigator.mediaDevices) {
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       if (mountedRef.current) {
-        setStatus("error");
-        setError("MediaDevices API not available");
+        // Task 3: distinguish "API missing" from a generic error so the gate
+        // can surface a specific HTTPS/browser message.
+        setStatus("unsupported");
+        setError("Camera API unavailable — needs HTTPS or a supported browser");
       }
       return;
     }
