@@ -9,6 +9,7 @@ import { paletteAsVector3, PALETTE_SIZE } from "@/lib/palette";
 
 // ---------------------------------------------------------------------------
 // Iter 18 — Mask sampling threshold
+// Iter 19 — Hard silhouette + mask-gamma tightening
 // ---------------------------------------------------------------------------
 /**
  * Person-probability threshold for the segmentation mask.
@@ -18,6 +19,17 @@ import { paletteAsVector3, PALETTE_SIZE } from "@/lib/palette";
  * values trim more aggressively (crisper but slightly smaller silhouette).
  */
 const MASK_THRESHOLD = 0.5;
+
+/**
+ * Iter 19 — Mask gamma for silhouette tightening.
+ * Applied as pow(maskProb, MASK_GAMMA) before the threshold comparison.
+ *   = 1.0 → no change (identity)
+ *   > 1.0 → suppresses low-confidence edge pixels → tighter, slightly
+ *            smaller silhouette (harder/more aggressive edge trim)
+ *   < 1.0 → expands borderline pixels into person territory (looser edge)
+ * Range 0.8–2.0 is practical; default 1.0 is safe/neutral.
+ */
+const MASK_GAMMA = 1.0;
 
 /**
  * Iteration 7 — Grid density + framing tune.
@@ -162,6 +174,7 @@ const fragmentShader = /* glsl */ `
   uniform float uVoidThreshold;   // base luma threshold; below this → snap to void  iter 8/12
 
   // Iter 18 — Segmentation mask uniforms.
+  // Iter 19 — uMaskGamma for silhouette tightening (hard-step only, no smoothing).
   //
   // uMask: RED/FLOAT DataTexture, 256×256. Each texel = person probability [0,1].
   //   Produced by MediaPipe selfie_segmenter in RAW (unmirrored) video space.
@@ -171,6 +184,13 @@ const fragmentShader = /* glsl */ `
   //
   // uMaskThreshold: probability below which a cell is treated as off-person.
   //   Default 0.5 — natural midpoint of [0,1] confidence output.
+  //
+  // uMaskGamma: iter 19 — exponent applied to maskProb before threshold
+  //   comparison: pow(maskProb, uMaskGamma). 1.0 = identity (no change).
+  //   Values > 1 suppress borderline edge pixels (tighter silhouette).
+  //   Values < 1 expand borderline pixels (looser silhouette).
+  //   This ONLY adjusts which side of the threshold a pixel falls on —
+  //   the final decision is always a HARD STEP (no smoothstep, no alpha).
   //
   // ── Coordinate alignment ─────────────────────────────────────────────────
   //   vUv (= aUv) already encodes the mirrored + cropped + zoomed UV for each
@@ -182,6 +202,7 @@ const fragmentShader = /* glsl */ `
   uniform sampler2D uMask;
   uniform float     uMaskActive;
   uniform float     uMaskThreshold;
+  uniform float     uMaskGamma;
   // Iter 13 — Accent scatter.
   // uAccentAmount: probability [0,1] that a non-void cell is overridden with a
   // random accent swatch (palette indices 3..7: magenta, cyan, blue, red, amber).
@@ -293,6 +314,27 @@ const fragmentShader = /* glsl */ `
   }
 
   void main() {
+    // =========================================================================
+    // FRAGMENT PIPELINE ORDER (iter 19):
+    //
+    //  1. MASK GATE (silhouette boundary — hard-step, aliased, no smoothing)
+    //     Off-person cells → void immediately; control flow exits.
+    //     Graceful fallback: when mask not ready, skip gate (whole frame = person).
+    //
+    //  2. LUMA VOID FLOOR (internal body voids, lower-body bias)
+    //     Runs ONLY for cells that passed the mask gate (i.e. inside the person).
+    //     Dark / shadow pixels inside the body collapse to void black, punching
+    //     characteristic holes through the figure — especially lower chest.
+    //
+    //  3. PALETTE QUANTIZE + LIME BIAS
+    //     Non-void body cells are snapped to the nearest neon palette entry with
+    //     a mid-luma lime pull (indices 1–2 get preference for mid-tone body mass).
+    //
+    //  4. ACCENT SCATTER
+    //     A random ~12% of non-void body cells are overridden with an accent color
+    //     (magenta/cyan/blue/red/amber) for glitch variety.
+    // =========================================================================
+
     // Iter 6: hard square cells. We do NOT test gl_PointCoord distance so the
     // full point-sprite quad is filled — no circular masking, no discard, no
     // alpha smoothstep. Every fragment within the point gets the same sampled
@@ -304,7 +346,8 @@ const fragmentShader = /* glsl */ `
     // so there is no double-encode.
     vec4 texColor = texture2D(uVideo, vUv);
 
-    // Iter 18 — Segmentation mask gate (runs before luma void check).
+    // ── Step 1: MASK GATE ─────────────────────────────────────────────────────
+    // Iter 18/19 — Segmentation mask gate (silhouette boundary).
     //
     // Sample the 256×256 person-probability mask at the same UV as the video
     // texture. vUv encodes the mirrored+cropped+zoomed UV, so it reads the
@@ -313,21 +356,44 @@ const fragmentShader = /* glsl */ `
     // When uMaskActive == 0.0 (mask not ready), skip masking entirely so the
     // mosaic renders as it did before iter 18 — no visual regression on load.
     //
-    // When the mask says this cell is background (prob < uMaskThreshold),
-    // output void black immediately without entering the luma/palette path.
-    // This produces the clean bust silhouette: only person-covered cells get
-    // their neon color; off-person cells collapse to the void background.
+    // Iter 19 — HARD ALIASED EDGE:
+    //   The silhouette boundary is determined by a HARD STEP — no smoothstep,
+    //   no mix, no alpha gradient at the boundary. This produces the jagged,
+    //   aliased edge required by docs/visual-reference.md (§4 "Edges are
+    //   jagged/aliased on purpose — no anti-aliasing").
+    //
+    //   Implementation:
+    //     a) Apply uMaskGamma: prob = pow(raw, uMaskGamma)
+    //        (gamma > 1 tightens the silhouette by suppressing low-confidence
+    //         border pixels; = 1.0 is identity; < 1 expands it)
+    //     b) Hard binary decision: step(uMaskThreshold, prob)
+    //        → 0.0 when prob < threshold (off-person → void)
+    //        → 1.0 when prob >= threshold (person → continue)
+    //     No interpolation anywhere in this path.
     if (uMaskActive > 0.5) {
-      float maskProb = texture2D(uMask, vUv).r;
-      if (maskProb < uMaskThreshold) {
+      float rawProb  = texture2D(uMask, vUv).r;
+      // Iter 19: gamma on raw probability to tighten/loosen silhouette edge.
+      // pow(x, 1.0) = x (identity); pow(x, 2.0) shrinks borderline edge pixels.
+      float maskProb = pow(rawProb, uMaskGamma);
+      // Hard step: 0.0 = off-person, 1.0 = person. NO smoothstep — aliased edge.
+      float inPerson = step(uMaskThreshold, maskProb);
+      if (inPerson < 0.5) {
+        // Off-person → void immediately; skip all body processing below.
         gl_FragColor = vec4(uVoidColor, 1.0);
         return;
       }
     }
 
+    // ── Step 2: LUMA VOID FLOOR (inside-mask only) ───────────────────────────
     // Iter 8 — Void floor: collapse very dark cells to the exact void color so
     // background noise merges seamlessly with the scene background (#0a0f0a).
     // Luma via Rec.601 weights (GLSL r169-valid; no nonexistent functions used).
+    //
+    // Iter 19 — This step ONLY executes for cells that passed the mask gate
+    // above (i.e. cells inside the person silhouette). Off-person cells already
+    // returned as void — so luma voids punch holes only INSIDE the body, never
+    // in the already-void background. This keeps the silhouette clean and avoids
+    // redundant computation on background cells.
     float luma = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
 
     // Iter 12 — Effective void threshold with lower-body spatial bias.
@@ -350,12 +416,14 @@ const fragmentShader = /* glsl */ `
     // Iter 12: use effectiveThreshold instead of raw uVoidThreshold.
     vec3 preQuantize = luma < effectiveThreshold ? uVoidColor : texColor.rgb;
 
+    // ── Step 3: PALETTE QUANTIZE + LIME BIAS ─────────────────────────────────
     // Quantize to the nearest neon swatch (luma-weighted perceptual distance).
     // uPaletteMix = 1.0 → full quantization; = 0.0 → pass-through (iter 8 mode).
     // Iter 11: pass luma so nearestPaletteColor can apply mid-band lime bias.
     vec3 quantized = nearestPaletteColor(preQuantize, luma);
     vec3 finalRgb = mix(preQuantize, quantized, uPaletteMix);
 
+    // ── Step 4: ACCENT SCATTER ───────────────────────────────────────────────
     // Iter 13 — Accent scatter: sprinkle random accent pops over non-void cells.
     // Strategy: derive a stable per-cell coordinate from vUv, then draw two hashes
     // — one to decide IF this cell gets an accent, one to pick WHICH accent color.
@@ -640,9 +708,15 @@ export default function Mosaic() {
       // uMaskActive: 0.0 until the first mask texture is produced; then 1.0.
       //   Prevents shader from sampling an uninitialised texture.
       // uMaskThreshold: probability below which a cell is gated to void.
+      // uMaskGamma (iter 19): exponent applied to raw mask prob before threshold.
+      //   1.0 = identity (no change to silhouette edge).
+      //   > 1.0 = tighter silhouette (suppresses low-confidence border pixels).
+      //   < 1.0 = looser silhouette (admits more borderline pixels as person).
+      //   DOES NOT affect edge smoothness — boundary is always a hard step.
       uMask:           { value: null },
       uMaskActive:     { value: 0.0 },
       uMaskThreshold:  { value: MASK_THRESHOLD },
+      uMaskGamma:      { value: MASK_GAMMA },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
