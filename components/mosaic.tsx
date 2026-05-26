@@ -353,6 +353,22 @@ const fragmentShader = /* glsl */ `
     return fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
   }
 
+  // Iter 22 — Pixel-sort streaks (Kim Asendorf-style horizontal smear).
+  //
+  // uSortThreshold:  luma value above (or below) which a cell is a "sort trigger".
+  //                  Cells with luma >= uSortThreshold are eligible to streak.
+  //                  Default 0.55 — bright body tones trigger the sort.
+  // uSortRun:        maximum run-width in UV space (fraction of full U range).
+  //                  Several adjacent cells sharing the same snapped U column
+  //                  → they all read the same source pixel → visible smear/drag.
+  //                  Default 0.08 (~5 cells wide at 64 columns).
+  // uSortAmount:     base probability [0,1] that an eligible cell actually streaks.
+  //                  Keeps streaks a clear minority; motion scales it up.
+  //                  Default 0.18.
+  uniform float uSortThreshold;
+  uniform float uSortRun;
+  uniform float uSortAmount;
+
   void main() {
     // =========================================================================
     // FRAGMENT PIPELINE ORDER (iter 19):
@@ -416,6 +432,85 @@ const fragmentShader = /* glsl */ `
     // read outside the texture (wraps would smear background into the figure).
     vec2 tearUv = vec2(clamp(vUv.x + uShift, 0.0, 1.0), vUv.y);
 
+    // ── Iter 22: Pixel-sort streaks ───────────────────────────────────────────
+    // Approximates Kim Asendorf-style horizontal pixel sorting in the shader.
+    //
+    // Real pixel sort: scan a row, find runs where luma exceeds a threshold,
+    // and sort (or hold) those runs so bright pixels drag rightward — producing
+    // horizontal smears of repeated color. We approximate this per-cell:
+    //
+    //   1. Decide if this BAND should have pixel-sort activity at all.
+    //      Uses the same bandIdx as the tear logic; a separate hash (hSort)
+    //      gates whether this band participates. Coupling to bands keeps the
+    //      streaks directionally aligned with the tear rows — cohesive look.
+    //
+    //   2. Within an active band, check if this CELL is eligible:
+    //      Gate by a hash (hSortCell < effSortAmount) so only a minority of
+    //      cells in active bands actually streak. This is independent of luma
+    //      at this stage so we can sample luma cheaply from the tearUv first.
+    //
+    //   3. Sample luma at the current tearUv position. If luma >= uSortThreshold
+    //      (bright cell — typical sort trigger for Kim Asendorf runs), apply the
+    //      column-hold: snap the U coordinate to the start of a run block so
+    //      several adjacent cells read the SAME source column. Run width varies
+    //      per band via hRunWidth so adjacent bands have different streak lengths.
+    //      This creates a blocky, hard-edged horizontal smear — exactly the
+    //      "held/dragged pixel" look of pixel-sorted databending.
+    //
+    //   Motion scaling: effective run width and sort probability grow with
+    //   uMotion so fast movement intensifies the streaking effect.
+    //
+    // sampleUv starts as tearUv; we may replace its X for streaked cells.
+    vec2 sampleUv = tearUv;
+
+    // Hash 1: does this band participate in pixel-sort at all?
+    // Independent seed from tear-gate hash (offset constants).
+    float hSort = fract(sin(dot(vec2(bandIdx + 200.0, quantizedTime + 13.0),
+                                vec2(54.7391, 23.4817))) * 91734.2819);
+
+    // Only ~40 % of bands can host streaks by default (tuned by uSortAmount gate
+    // below per-cell; this band-level gate is a second layer that limits which
+    // rows can ever streak, keeping effect spatially sparse).
+    if (hSort < 0.4) {
+      // Per-cell eligibility hash — independent of bandIdx so cells within the
+      // band each get their own decision.
+      vec2 cellCoord = floor(tearUv * 64.0);
+      float hSortCell = cellHash(cellCoord + vec2(99.0, 11.0));
+
+      // Motion-boosted sort probability.  At idle: base.  At full motion: ~2×.
+      float effSortAmount = min(uSortAmount * (1.0 + uMotion * 1.0), 0.80);
+
+      if (hSortCell < effSortAmount) {
+        // Quick luma probe at tearUv (cheap — same texel we'll sample below).
+        vec4 probeTex = texture2D(uVideo, tearUv);
+        float probeLuma = dot(probeTex.rgb, vec3(0.299, 0.587, 0.114));
+
+        // Threshold gate: only bright-enough cells trigger the sort run.
+        if (probeLuma >= uSortThreshold) {
+          // Run width: how many UV units share the same source column.
+          // Varies per band via a dedicated hash so adjacent bands differ in
+          // streak length — looks organic rather than uniformly banded.
+          float hRunWidth = fract(sin(dot(vec2(bandIdx + 300.0, quantizedTime + 71.0),
+                                          vec2(17.6421, 88.3124))) * 62841.7531);
+          // Map hRunWidth [0,1] → [0.25, 1.0] of uSortRun so the shortest
+          // streaks are still visibly blocky (≥ 2 cells wide at 64 cols).
+          float runWidth = uSortRun * (0.25 + hRunWidth * 0.75);
+          // Motion stretches the run: fast movement drags streaks longer.
+          runWidth *= (1.0 + uMotion * 0.8);
+          // Clamp: never wider than half the full U range (don't smear everything).
+          runWidth = min(runWidth, 0.5);
+
+          // Column-hold: snap U to the nearest run boundary.
+          // All cells within [k*runWidth, (k+1)*runWidth) share the same snapped U.
+          // This makes adjacent cells read the identical source column → smear.
+          float snappedU = floor(tearUv.x / runWidth) * runWidth;
+          // Keep snappedU inside [0, 1).
+          snappedU = clamp(snappedU, 0.0, 1.0 - runWidth * 0.5);
+          sampleUv.x = snappedU;
+        }
+      }
+    }
+
     // Iter 6: hard square cells. We do NOT test gl_PointCoord distance so the
     // full point-sprite quad is filled — no circular masking, no discard, no
     // alpha smoothstep. Every fragment within the point gets the same sampled
@@ -426,7 +521,11 @@ const fragmentShader = /* glsl */ `
     // sRGB; we output it directly. The renderer output colorspace is also sRGB,
     // so there is no double-encode.
     // Iter 21: sample video from tearUv (shifted) instead of vUv.
-    vec4 texColor = texture2D(uVideo, tearUv);
+    // Iter 22: sampleUv may further shift the U coordinate for pixel-sort streaks.
+    //          The mask continues to sample from tearUv (unmodified by sort) so
+    //          the silhouette gate stays aligned with the band-shifted geometry,
+    //          not the column-held smear position (mask shouldn't smear).
+    vec4 texColor = texture2D(uVideo, sampleUv);
 
     // ── Step 1: MASK GATE ─────────────────────────────────────────────────────
     // Iter 18/19 — Segmentation mask gate (silhouette boundary).
@@ -868,6 +967,19 @@ export default function Mosaic() {
       uTearBands:       { value: 30.0 },
       uTearProbability: { value: 0.25 },
       uTearAmount:      { value: 0.035 },
+      // Iter 22 — Pixel-sort streak uniforms.
+      // uSortThreshold: luma above which a cell is eligible to streak (bright-run
+      //   trigger, matching Asendorf light-sort behavior). Default 0.55.
+      // uSortRun: maximum run width in UV space. At 64 columns, UV step per cell
+      //   ≈ 1/64 ≈ 0.016; 0.08 ≈ 5 cells wide at max — clearly blocky streak.
+      //   Shorter runs (~0.02) still read as a hold; longer runs (>0.12) risk
+      //   smearing too much of the figure. Default 0.08.
+      // uSortAmount: base probability that an eligible cell in an active band
+      //   actually streaks. 0.18 → ~18 % of eligible cells → minority effect.
+      //   Motion boosts this up to ~36 % at full speed (capped at 0.80 in shader).
+      uSortThreshold:   { value: 0.55 },
+      uSortRun:         { value: 0.08 },
+      uSortAmount:      { value: 0.18 },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
