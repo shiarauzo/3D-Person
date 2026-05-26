@@ -32,7 +32,7 @@ An interactive webcam piece that re-renders your live silhouette as a coarse neo
 - **Secure context**: `getUserMedia` requires HTTPS or `localhost`. Running `bun run dev` on `http://localhost:3000` is fine. A deployed build needs HTTPS.
 - **Runtime**: [Bun](https://bun.sh/) (or npm / pnpm if you prefer — the scripts are standard Next.js).
 - **Node**: Node 18+ (required by Next.js 15).
-- **Network on first load**: MediaPipe WASM bundle and model files load from CDN on first run (jsdelivr for WASM, Google Storage for `.task` model files). Subsequent loads use the browser cache. For offline or restricted deploys, see the swap instructions in [`lib/tracking/mediapipe.ts`](lib/tracking/mediapipe.ts).
+- **MediaPipe assets**: WASM and model files are vendored into `public/mediapipe/` by running `bun run assets` (called automatically as `predev`/`prebuild`). The script copies WASM from `node_modules/@mediapipe/tasks-vision/wasm/` and downloads the three model files from Google Storage on first run (cached on disk; skipped on subsequent runs). The `public/mediapipe/` directory is gitignored so no large binaries are committed. At runtime the app tries local assets first; if they are absent or fail to load (e.g. fresh clone without running `assets`), it falls back transparently to the CDN URLs.
 
 ---
 
@@ -183,5 +183,5 @@ Shaders are **inline GLSL** inside `components/mosaic.tsx` (vertex + fragment as
 - **Slider defaults** — change values in [`lib/controls-defaults.ts`](lib/controls-defaults.ts). Both the TUNE panel and the mosaic shader uniform init read from this file, so the default visual output stays consistent.
 - **Grid density** — change `GRID_W` in [`components/mosaic.tsx`](components/mosaic.tsx) (currently `64`). The valid range from the spec is 40–80 cells. Note: some GPU drivers clamp `gl_PointSize` around 64 px; if cells collapse at low densities, the fallback is to switch the geometry from `THREE.Points` to `InstancedMesh` quads (not subject to the `gl_PointSize` limit).
 - **Shader effects** — the vertex and fragment shaders live as inline GLSL strings at the top of `components/mosaic.tsx`. Each iter block is clearly commented. The fragment pipeline order is: channel-split → mask gate → luma void floor → palette quantize → lime bias → accent scatter → face chaos.
-- **MediaPipe models** — model URLs and the WASM base URL are constants at the top of [`lib/tracking/mediapipe.ts`](lib/tracking/mediapipe.ts). To run offline, copy the CDN assets into `public/` and update those constants to local paths.
+- **MediaPipe models** — local and CDN URLs are constants at the top of [`lib/tracking/mediapipe.ts`](lib/tracking/mediapipe.ts). The runtime prefers local vendored assets (populated by `bun run assets`) and falls back to CDN automatically. Run `bun run assets` to refresh the vendored files after upgrading `@mediapipe/tasks-vision`.
 - **Tracking frame rates** — `HAND_POSE_FPS` (30) and `SEG_FPS` (18) are constants in [`hooks/use-tracking.ts`](hooks/use-tracking.ts). Lower them to reduce CPU load on slow hardware.
