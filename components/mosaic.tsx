@@ -398,10 +398,12 @@ const fragmentShader = /* glsl */ `
     float vGrad = smoothstep(0.05, 0.95, 1.0 - vUv.y);
 
     // Low-frequency value noise: coherent blobs, slow time drift.
-    float nz = valueNoise(cell * 0.065 + uTime * 0.07);
+    // uNoiseScale controls spatial frequency; uNoiseDrift controls time speed.
+    float nz = valueNoise(cell * uNoiseScale + uTime * uNoiseDrift);
 
-    // Weighted blend.
-    return clamp(nz * 0.65 + vGrad * 0.35, 0.0, 1.0);
+    // Weighted blend: noise share = (1 - uGradientMix), gradient share = uGradientMix.
+    // At default uGradientMix=0.35 this equals the prior nz*0.65 + vGrad*0.35.
+    return clamp(nz * (1.0 - uGradientMix) + vGrad * uGradientMix, 0.0, 1.0);
   }
 
   // Iter 22 — Pixel-sort streaks (Kim Asendorf-style horizontal smear).
@@ -483,6 +485,35 @@ const fragmentShader = /* glsl */ `
   uniform float uChannelShift;
   uniform float uChannelFaceBias;
   uniform float uChannelTearBias;
+
+  // V2 — PLAN-V2 issue 11: Synthetic-field tuning uniforms.
+  // These promote the magic-number constants in synthField / texColor to
+  // live-tunable uniforms. Defaults equal the prior hardcoded literals so
+  // there is no visual change at the reset state.
+  //
+  // uNoiseScale:  spatial frequency multiplier for the value-noise lattice.
+  //               cell * uNoiseScale + ... → smaller values = larger blobs.
+  //               Range ~0.02–0.20; default 0.065.
+  // uNoiseDrift:  uTime drift speed for the value noise.
+  //               Lower = slower organic shift; higher = churning chaos.
+  //               Range 0.0–0.3; default 0.07.
+  // uGradientMix: weight of the vertical gradient in the blend.
+  //               synthLuma = nz*(1-uGradientMix) + vGrad*uGradientMix.
+  //               0 = all noise (uniform blob), 1 = pure gradient (no blob).
+  //               Range 0.0–1.0; default 0.35.
+  // uEdgeBoost:   additive boost to synthLuma at silhouette edges.
+  //               synthLuma += edgeFactor * uEdgeBoost.
+  //               Higher = hotter/busier rim; 0 = flat interior.
+  //               Range 0.0–1.0; default 0.35.
+  // uLimeMix:     mix factor from the lime base toward the per-channel luma.
+  //               mix(limeBase, lumChannel, uLimeMix).
+  //               0 = solid lime, 1 = raw per-channel luma (neon variety).
+  //               Range 0.0–1.0; default 0.55.
+  uniform float uNoiseScale;
+  uniform float uNoiseDrift;
+  uniform float uGradientMix;
+  uniform float uEdgeBoost;
+  uniform float uLimeMix;
 
   void main() {
     // =========================================================================
@@ -682,11 +713,13 @@ const fragmentShader = /* glsl */ `
     // and modulate R/B channels with their shifted lumas so the channel split
     // creates visible hue shifts near the face/tears.
     vec3 limeBase = vec3(0.784, 0.941, 0.0);
-    // Slightly de-saturate toward channel luma so the split is visible.
+    // De-saturate toward per-channel luma so the channel split is visible.
+    // uLimeMix controls how strongly each channel is pulled toward its luma
+    // vs. remaining on the lime base. Default 0.55 matches the prior literal.
     vec3 texColor = vec3(
-      mix(limeBase.r, lumR, 0.55),
-      mix(limeBase.g, lumG, 0.55),
-      mix(limeBase.b, lumB, 0.55)
+      mix(limeBase.r, lumR, uLimeMix),
+      mix(limeBase.g, lumG, uLimeMix),
+      mix(limeBase.b, lumB, uLimeMix)
     );
 
     // V2: texColor is the procedural channel-split synthetic color.
@@ -748,8 +781,8 @@ const fragmentShader = /* glsl */ `
     float edgeFactor = clamp(maskGrad, 0.0, 1.0);
 
     // Face region also reads hotter (faceFactor already computed above).
-    // Boost synthLuma at edges and face; interior body stays mid-range for lime.
-    float synthLuma = clamp(baseSynth + edgeFactor * 0.35 + faceFactor * 0.25, 0.0, 1.0);
+    // Boost synthLuma at edges (uEdgeBoost) and face; interior body stays mid-range for lime.
+    float synthLuma = clamp(baseSynth + edgeFactor * uEdgeBoost + faceFactor * 0.25, 0.0, 1.0);
 
     // Keep "luma" as the canonical variable name so all downstream stages
     // (void threshold, palette quantize, accent gate) are unchanged.
@@ -1261,6 +1294,14 @@ export default function Mosaic() {
       uChannelShift:    { value: CHANNEL_SHIFT },
       uChannelFaceBias: { value: CHANNEL_FACE_BIAS },
       uChannelTearBias: { value: CHANNEL_TEAR_BIAS },
+      // V2 — PLAN-V2 issue 11: Synthetic-field tuning uniforms.
+      // Defaults sourced from CONTROLS_DEFAULTS so they exactly match the prior
+      // hardcoded GLSL literals — no visual change at the reset state.
+      uNoiseScale:  { value: CONTROLS_DEFAULTS.noiseScale },
+      uNoiseDrift:  { value: CONTROLS_DEFAULTS.noiseDrift },
+      uGradientMix: { value: CONTROLS_DEFAULTS.gradientMix },
+      uEdgeBoost:   { value: CONTROLS_DEFAULTS.edgeBoost },
+      uLimeMix:     { value: CONTROLS_DEFAULTS.limeMix },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
@@ -1289,6 +1330,12 @@ export default function Mosaic() {
     uniforms.uLimeBias.value        = controls.limeBias;
     uniforms.uDeformStrength.value  = squarePx * controls.deformStrength;
     uniforms.uFaceAccentBoost.value = controls.faceAccentBoost;
+    // V2 — PLAN-V2 issue 11: sync synthetic-field knobs.
+    uniforms.uNoiseScale.value  = controls.noiseScale;
+    uniforms.uNoiseDrift.value  = controls.noiseDrift;
+    uniforms.uGradientMix.value = controls.gradientMix;
+    uniforms.uEdgeBoost.value   = controls.edgeBoost;
+    uniforms.uLimeMix.value     = controls.limeMix;
   }, [controls, uniforms, squarePx]);
 
   // -------------------------------------------------------------------------

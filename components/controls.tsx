@@ -25,12 +25,18 @@ interface SliderSpec {
 }
 
 const SLIDERS: SliderSpec[] = [
-  { key: "voidThreshold",   label: "VOID THR",    min: 0.05, max: 0.50, step: 0.01 },
-  { key: "tearProbability", label: "TEAR PROB",   min: 0.00, max: 0.80, step: 0.01 },
-  { key: "tearAmount",      label: "TEAR AMNT",   min: 0.00, max: 0.15, step: 0.005 },
-  { key: "accentAmount",    label: "ACCENT",      min: 0.00, max: 0.60, step: 0.01 },
-  { key: "limeBias",        label: "LIME BIAS",   min: 0.00, max: 1.00, step: 0.01 },
-  { key: "faceAccentBoost", label: "FACE BOOST",  min: 0.00, max: 8.00, step: 0.1  },
+  { key: "voidThreshold",   label: "VOID THR",    min: 0.05, max: 0.50,  step: 0.01  },
+  { key: "tearProbability", label: "TEAR PROB",   min: 0.00, max: 0.80,  step: 0.01  },
+  { key: "tearAmount",      label: "TEAR AMNT",   min: 0.00, max: 0.15,  step: 0.005 },
+  { key: "accentAmount",    label: "ACCENT",      min: 0.00, max: 0.60,  step: 0.01  },
+  { key: "limeBias",        label: "LIME BIAS",   min: 0.00, max: 1.00,  step: 0.01  },
+  { key: "faceAccentBoost", label: "FACE BOOST",  min: 0.00, max: 8.00,  step: 0.1   },
+  // V2 — PLAN-V2 issue 11: synthetic-field knobs.
+  { key: "noiseScale",      label: "NOISE SCALE", min: 0.02, max: 0.20,  step: 0.002 },
+  { key: "noiseDrift",      label: "DRIFT",       min: 0.00, max: 0.30,  step: 0.005 },
+  { key: "gradientMix",     label: "GRADIENT",    min: 0.00, max: 1.00,  step: 0.01  },
+  { key: "edgeBoost",       label: "EDGE",        min: 0.00, max: 1.00,  step: 0.01  },
+  { key: "limeMix",         label: "LIME",        min: 0.00, max: 1.00,  step: 0.01  },
 ];
 
 export default function Controls() {
