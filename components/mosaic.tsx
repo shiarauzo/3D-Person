@@ -58,8 +58,27 @@ const vertexShader = /* glsl */ `
 
 const fragmentShader = /* glsl */ `
   uniform sampler2D uVideo;
-  uniform vec3  uVoidColor;      // near-black void (#0a0f0a)  iter 8
-  uniform float uVoidThreshold;  // luma below this → snap to void  iter 8
+  uniform vec3  uVoidColor;       // near-black void (#0a0f0a)  iter 8
+  uniform float uVoidThreshold;   // base luma threshold; below this → snap to void  iter 8/12
+  // Iter 12 — Lower-body void bias.
+  // Adds a small amount to the effective void threshold for cells in the lower
+  // part of the frame, so darker body shadows (especially lower chest) collapse
+  // to void black more readily.
+  //
+  // COORDINATE NOTE (traced from aUv construction in JS):
+  //   row=0 (screen-bottom, lower chest) → aUv.y = vMaxZ ≈ 0.90  (LARGE)
+  //   row=63 (screen-top, face)          → aUv.y = vMinZ ≈ 0.10  (SMALL)
+  // VideoTexture flipY=false: V=0 = top of video (face), V=1 = bottom (chest).
+  // The (1-normRow) flip in the JS maps screen-bottom rows to high V values.
+  // Therefore vUv.y is LARGE at the lower chest and SMALL at the face.
+  //
+  // uVoidV0 / uVoidV1 define the V window [v0, v1] in lower-chest territory
+  // (both values > 0.5). The ramp t = clamp((vUv.y - v0)/(v1-v0), 0, 1),
+  // and the bias applied is uVoidLowerBias * t — zero at the face, maximum
+  // at the lower-chest bottom. Default window: v0=0.55, v1=0.90.
+  uniform float uVoidLowerBias;  // max additional threshold at the lower chest (default 0.06)
+  uniform float uVoidV0;         // V where the bias starts ramping up (default 0.55, mid-chest)
+  uniform float uVoidV1;         // V where the bias reaches maximum (default 0.90, bottom crop)
 
   // Iter 9/10 — Palette LUT.
   // GLSL ES requires a compile-time constant for array size — use #define.
@@ -149,12 +168,25 @@ const fragmentShader = /* glsl */ `
     // Luma via Rec.601 weights (GLSL r169-valid; no nonexistent functions used).
     float luma = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
 
+    // Iter 12 — Effective void threshold with lower-body spatial bias.
+    // vUv.y is LARGE at the lower chest (~0.90) and SMALL at the face (~0.10)
+    // because row=0 (screen-bottom / lower chest) maps to aUv.y = vMaxZ ≈ 0.90
+    // via the (1 - normRow) flip in the JS geometry builder, and VideoTexture
+    // uses flipY=false so V increases toward the bottom of the video frame.
+    // The ramp t goes from 0.0 (at or below uVoidV0, face region) to 1.0 (at or
+    // above uVoidV1, lower-chest region). The additive bias is uVoidLowerBias * t:
+    // zero at the face, maximum at the lower chest. This concentrates void holes
+    // in the lower chest while leaving the face/shoulders unaffected.
+    float t = clamp((vUv.y - uVoidV0) / (uVoidV1 - uVoidV0), 0.0, 1.0);
+    float effectiveThreshold = uVoidThreshold + uVoidLowerBias * t;
+
     // Iter 10 — Void-first ordering: dark cells are snapped to void BEFORE the
     // palette lookup so they can never be pulled to a bright neon by the nearest-
     // color search. Only above-threshold cells enter nearestPaletteColor, where
     // all 9 palette entries (including void black at index 0) are candidates —
     // near-dark-but-above-threshold cells will naturally pick void black anyway.
-    vec3 preQuantize = luma < uVoidThreshold ? uVoidColor : texColor.rgb;
+    // Iter 12: use effectiveThreshold instead of raw uVoidThreshold.
+    vec3 preQuantize = luma < effectiveThreshold ? uVoidColor : texColor.rgb;
 
     // Quantize to the nearest neon swatch (luma-weighted perceptual distance).
     // uPaletteMix = 1.0 → full quantization; = 0.0 → pass-through (iter 8 mode).
@@ -312,9 +344,27 @@ export default function Mosaic() {
       // Using Vector3 with the raw byte ratios bypasses that conversion, so the
       // shader's direct output matches the scene background exactly.
       uVoidColor:     { value: new THREE.Vector3(10 / 255, 15 / 255, 10 / 255) },
-      // uVoidThreshold: luma below this snaps to void. 0.12 catches dark
-      // background/edge noise without eating the subject (which is much brighter).
-      uVoidThreshold: { value: 0.12 },
+      // uVoidThreshold: base luma below which a cell snaps to void.
+      // Iter 12: raised from 0.12 → 0.20 so mid-dark body shadows (lower chest)
+      // also collapse to void black, punching characteristic holes through the
+      // figure per visual-reference.md. Keep below ~0.30 to avoid eating the
+      // whole figure; the lower-body bias handles the spatial gradient.
+      uVoidThreshold: { value: 0.20 },
+      // Iter 12 — Lower-body void bias uniforms.
+      // COORDINATE NOTE: vUv.y ≈ 0.10 = face/top, vUv.y ≈ 0.90 = lower chest.
+      // uVoidLowerBias: max additional threshold added for cells at the very
+      //   bottom of the frame (lower chest). Default 0.06 → effective threshold
+      //   at the lower chest = 0.20 + 0.06 = 0.26, enough to punch mid-dark
+      //   shadows. Raise toward 0.12 to eat more of the lower body; lower to 0.0
+      //   to disable the spatial bias entirely.
+      // uVoidV0 / uVoidV1: the V-coordinate ramp window. With UV_ZOOM=1.25 and
+      //   a 16:9 source the zoomed V range is roughly [0.10, 0.90].
+      //   v0=0.55 (mid-chest) and v1=0.90 (bottom of crop): bias ramps from zero
+      //   at the mid-chest line to full at the lower chest. Face (vUv.y ≈ 0.10)
+      //   is well outside this window and gets zero bias.
+      uVoidLowerBias: { value: 0.06 },
+      uVoidV0:        { value: 0.55 },
+      uVoidV1:        { value: 0.90 },
       // Iter 9 — Palette LUT uniforms (plumbing; not visually active yet).
       // paletteAsVector3() returns raw sRGB ratios (same reasoning as uVoidColor).
       uPalette:       { value: paletteAsVector3() },
