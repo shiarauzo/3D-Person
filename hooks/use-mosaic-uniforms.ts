@@ -120,6 +120,10 @@ export function useMosaicUniforms({
       uGradientMix: { value: CONTROLS_DEFAULTS.gradientMix },
       uEdgeBoost:   { value: CONTROLS_DEFAULTS.edgeBoost },
       uLimeMix:     { value: CONTROLS_DEFAULTS.limeMix },
+      // Improvement #2 — Body-structure uniforms.
+      uNoiseOctaves: { value: CONTROLS_DEFAULTS.noiseOctaves },
+      uFaceFeatures: { value: CONTROLS_DEFAULTS.faceFeatures },
+      uChestVoid:    { value: CONTROLS_DEFAULTS.chestVoid },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [] // intentionally empty — we mutate uniforms directly below
@@ -160,6 +164,10 @@ export function useMosaicUniforms({
     uniforms.uGradientMix.value = controls.gradientMix;
     uniforms.uEdgeBoost.value   = controls.edgeBoost;
     uniforms.uLimeMix.value     = controls.limeMix;
+    // Improvement #2 — sync body-structure knobs.
+    uniforms.uNoiseOctaves.value = controls.noiseOctaves;
+    uniforms.uFaceFeatures.value = controls.faceFeatures;
+    uniforms.uChestVoid.value    = controls.chestVoid;
   }, [controls, uniforms, squarePx]);
 
   return uniforms;

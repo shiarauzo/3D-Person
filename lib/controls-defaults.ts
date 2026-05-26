@@ -40,6 +40,14 @@ export interface ControlValues {
   edgeBoost: number;
   /** Lime vs. procedural channel mix, via mix(limeBase, channel, limeMix) (0=full lime, 1=full channel). */
   limeMix: number;
+
+  // ── Improvement #2 — Body-structure knobs ────────────────────────────────
+  /** Blend weight for the 3rd fractal noise octave (0=2-oct blobs, 1=3-oct fine grit). */
+  noiseOctaves: number;
+  /** Strength of procedural eye+mouth band dips inside the face bbox (0=none, 1=full). */
+  faceFeatures: number;
+  /** Strength of the lower-center chest/sternum void-cluster punch (0=none, 1=strong). */
+  chestVoid: number;
 }
 
 export const CONTROLS_DEFAULTS: ControlValues = {
@@ -57,4 +65,9 @@ export const CONTROLS_DEFAULTS: ControlValues = {
   gradientMix: 0.35,  // was: vGrad * 0.35 in weighted blend (noise share = 1 - 0.35 = 0.65)
   edgeBoost:   0.35,  // was: edgeFactor * 0.35 in synthLuma clamp
   limeMix:     0.55,  // was: mix(limeBase, lum*, 0.55) in texColor
+
+  // Improvement #2 — Body-structure knobs (new defaults, tuned for reference look).
+  noiseOctaves: 0.60, // 3-octave blend: 60% fine-grit contribution mixed in
+  faceFeatures: 0.55, // moderate eye/mouth band depth (strong but not crushing)
+  chestVoid:    0.50, // half-strength sternum void cluster
 };
